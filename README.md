@@ -203,7 +203,7 @@ The `model` parameter in API requests controls routing:
 ## Project Structure
 
 ```
-llm-gateway/
+llm-gateway/files/
 ├── main.py                 # FastAPI app, routing, cascade orchestration
 ├── router.py               # Heuristic intent classification
 ├── enhanced_router.py      # 4-layer router for large context requests
