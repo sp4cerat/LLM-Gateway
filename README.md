@@ -33,10 +33,13 @@ The gateway handles 80% of requests with free tools and cheap models. Web search
 - Deep web extraction via [trafilatura](https://github.com/adbar/trafilatura)
 - The LLM *decides* which tool to call — the gateway only executes
 
-**Web Enrichment Pipeline (20x cost savings)**
-- DuckDuckGo search → trafilatura full-text extraction → structured context injection
-- Cheap model + web context achieves expensive model quality
-- A web-enriched query costs $0.001 instead of $0.02 with Gemini 3 Flash directly
+**Web Search & Enrichment Pipeline**
+- Multi-engine search: DuckDuckGo + Google + Bing (scraping, no API keys needed)
+- Multi-query: model issues 2-3 parallel queries with different keywords for complex topics
+- 3-level search depth: `min` (snippets), `medium` (page download), `max` (multi-engine + thorough)
+- Full-text extraction via trafilatura with HTML fallback
+- Source citations: configurable footnotes with URLs appended to responses
+- All settings configurable in `config.yaml` (engines, result counts, source format)
 
 **Code Generation Quality**
 - Post-generation validator: bracket balance, `ast.parse`, truncation detection
@@ -118,7 +121,7 @@ Client (any OpenAI-compatible client or SDK)
 
 ```bash
 git clone https://github.com/sp4cerat/LLM-Gateway.git
-cd LLM-Gateway/files
+cd LLM-Gateway
 bash setup.sh
 ```
 
@@ -177,6 +180,36 @@ budget:
 
 All providers go through [OpenRouter](https://openrouter.ai) by default, so you only need one API key. You can also configure individual providers (Anthropic, OpenAI, Groq) — see the comments in `config.yaml`.
 
+### Web Search Configuration
+
+```yaml
+web_search:
+  max_snippets: 5              # DDG snippet results per query (1-10)
+  max_pages_deep: 3            # Pages to download in 'medium' depth (1-5)
+  max_pages_thorough: 5        # Pages to download in 'max' depth (1-5)
+  show_sources: true           # Append source URLs as footnotes to response
+  source_format: "footer"      # "footer" = [1] URL at end, "none" = disabled
+  engines: ["ddg"]             # Search engines: "ddg", "google", "bing"
+  multi_query: true            # Allow multiple parallel search queries
+  max_queries: 3               # Max parallel queries per search call
+```
+
+**Multi-engine example** — search DuckDuckGo and Bing in parallel:
+```yaml
+web_search:
+  engines: ["ddg", "bing"]     # Results are deduplicated across engines
+```
+
+**Source citations** — the model's response will end with:
+```
+---
+Quellen:
+[1] https://pmc.ncbi.nlm.nih.gov/articles/PMC8706438/ — Fluoroquinolone toxicity
+[2] https://example.com/research — AI in drug discovery
+```
+
+Set `show_sources: false` to disable.
+
 ### .env
 
 ```bash
@@ -203,7 +236,7 @@ The `model` parameter in API requests controls routing:
 ## Project Structure
 
 ```
-llm-gateway/files/
+llm-gateway/
 ├── main.py                 # FastAPI app, routing, cascade orchestration
 ├── router.py               # Heuristic intent classification
 ├── enhanced_router.py      # 4-layer router for large context requests
