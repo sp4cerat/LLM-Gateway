@@ -61,7 +61,10 @@ from tool_executor import (
     TOOL_DEFINITIONS, TOOL_CASCADE_SYSTEM_PROMPT,
     SYNTHESIS_PROMPTS, build_synthesis_prompt,
     extract_blueprint, extract_context_strategy,
+    extract_output_architecture, generate_auto_architecture,
     generate_auto_blueprint, execute_tool_calls,
+    get_last_source_footer, clear_source_footer,
+    tool_web_search,
 )
 try:
     from web_enrichment import get_web_enricher, classify_needs_enrichment
@@ -210,6 +213,19 @@ app = FastAPI(
     description="Cost-Optimized AI Routing Gateway",
     lifespan=lifespan,
 )
+
+# ─── Validation Error Handler (log 422 details) ────────────────────────────
+from fastapi.exceptions import RequestValidationError
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Log detailed validation errors for debugging 422s."""
+    errors = exc.errors()
+    log.error(f"422 Validation Error on {request.url.path}: {errors}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": errors},
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -799,6 +815,82 @@ async def _try_code_repair(
     log.info(f"[{request_id}] Code repair: got {len(repaired)} chars "
              f"(original {len(broken_content)}), cost=${cost:.6f}")
     return repaired, [cost], [tok], True
+
+
+def _filter_source_footer(llm_response: str, source_footer: str) -> tuple[str, str]:
+    """Filter source footer to only include sources actually referenced in the LLM response.
+    Returns (updated_response, filtered_footer) with consistent renumbering.
+
+    Matches these reference formats in the LLM response:
+      - [1], [2], [3]                  (new format)
+      - [1, 3, 5]                      (grouped new format)
+      - (Quelle 1), (Quelle 1, 2, 3)  (legacy format)
+      - (Source 1, 3)                  (legacy English)
+
+    The source footer contains lines like "[1] https://... — Title".
+    Only keeps footer lines whose [N] number was actually referenced.
+    If no numbered references are found, returns all sources unchanged.
+    Renumbers both the response text AND footer to be sequential.
+    """
+    import re
+
+    referenced_nums = set()
+
+    # Pattern 1: [N] inline references — e.g. "text [1]." or "text [3]"
+    # Match [N] that is NOT at the start of a line (to avoid matching footer lines)
+    for m in re.finditer(r'(?<!^)\[(\d+)\]', llm_response, re.MULTILINE):
+        referenced_nums.add(int(m.group(1)))
+
+    # Pattern 2: [N, M, ...] grouped references — e.g. "[1, 3, 5]"
+    for m in re.finditer(r'\[(\d+(?:\s*,\s*\d+)+)\]', llm_response):
+        for num_str in re.findall(r'\d+', m.group(1)):
+            referenced_nums.add(int(num_str))
+
+    # Pattern 3: (Quelle N) or (Quelle N, M) — legacy format
+    for m in re.findall(
+        r'\((?:Quelle|Source|Src|Q)[\s:]+([0-9,\s]+)\)', llm_response, re.IGNORECASE
+    ):
+        for num_str in re.findall(r'\d+', m):
+            referenced_nums.add(int(num_str))
+
+    # If no numbered references found, return all sources (can't filter)
+    if not referenced_nums:
+        return llm_response, source_footer
+
+    # Parse footer lines and keep only referenced ones, building renumber map
+    footer_lines = source_footer.strip().split("\n")
+    filtered = []
+    renumber_map = {}  # old_num → new_num
+    new_idx = 1
+    for line in footer_lines:
+        # Keep header lines (---, "Quellen:", "Sources:")
+        if line.startswith("---") or line.endswith(":"):
+            filtered.append(line)
+            continue
+        # Parse [N] from footer line
+        num_match = re.match(r'\[(\d+)\]', line)
+        if num_match:
+            orig_num = int(num_match.group(1))
+            if orig_num in referenced_nums:
+                renumber_map[orig_num] = new_idx
+                filtered.append(re.sub(r'^\[\d+\]', f'[{new_idx}]', line))
+                new_idx += 1
+
+    # Return filtered footer (or all if filtering removed everything)
+    if new_idx > 1 and renumber_map:
+        # Renumber references in the response text to match new footer numbering
+        updated_response = llm_response
+        # Use placeholders to avoid collision (e.g., [4]→[2] then [2]→[1])
+        # Step 1: Replace all old refs with unique placeholders
+        for old_num in renumber_map:
+            updated_response = updated_response.replace(
+                f"[{old_num}]", f"[__REF_{old_num}__]")
+        # Step 2: Replace placeholders with new numbers
+        for old_num, new_num in renumber_map.items():
+            updated_response = updated_response.replace(
+                f"[__REF_{old_num}__]", f"[{new_num}]")
+        return updated_response, "\n".join(filtered)
+    return llm_response, source_footer
 
 
 @app.post("/v1/chat/completions")
@@ -1597,28 +1689,33 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     if tc.get("function", {}).get("name") == "web_search":
                         try:
                             _tc_args = json.loads(tc.get("function", {}).get("arguments", "{}"))
-                            _search_depth = _tc_args.get("depth", "snippets")
+                            _search_depth = _tc_args.get("search_depth",
+                                            _tc_args.get("depth", "snippets"))
+                            # Normalize: min/medium/max → snippets/deep/thorough
+                            _depth_map = {"min": "snippets", "medium": "deep", "max": "thorough"}
+                            _search_depth = _depth_map.get(_search_depth, _search_depth)
                             _analysis_mode = _tc_args.get("analysis_mode", "factual")
                         except (json.JSONDecodeError, AttributeError):
                             pass
 
-                # Extract ANALYSE-BLUEPRINT from Round 1 assistant content
-                _blueprint = extract_blueprint(response_content) if response_content else ""
+                # Extract output_architecture JSON from Round 1 assistant content
+                _output_arch = extract_output_architecture(response_content) if response_content else {}
+                _blueprint = extract_blueprint(response_content) if (response_content and not _output_arch) else ""
 
-                # Auto-Blueprint fallback: if Round 1 generated no content (content_len=0)
-                # but we have deep/thorough depth, generate a reasonable default blueprint
-                if not _blueprint and _search_depth in ("deep", "thorough"):
+                # Auto-architecture fallback: if Round 1 generated no architecture/blueprint
+                # but we have deep/thorough depth, generate a reasonable default
+                if not _output_arch and not _blueprint and _search_depth in ("deep", "thorough"):
                     # Get original user query for context
                     _user_query = ""
                     for _m in reversed(trimmed_messages):
                         if _m.role == "user":
                             _user_query = _m.content[:200]
                             break
-                    _blueprint = generate_auto_blueprint(_user_query, _analysis_mode)
-                    log.info(f"[{request_id}] Auto-blueprint generated "
+                    _output_arch = generate_auto_architecture(_user_query, _analysis_mode)
+                    log.info(f"[{request_id}] Auto-architecture generated "
                              f"(R1 content_len={len(response_content or '')})")
 
-                # ── Extract KONTEXT-MODUS for context strategy ──
+                # ── Extract context strategy (JSON or legacy text) ──
                 _ctx_strategy = extract_context_strategy(
                     response_content) if response_content else {"mode": "full"}
 
@@ -1627,6 +1724,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     depth=_search_depth,
                     analysis_mode=_analysis_mode,
                     blueprint=_blueprint,
+                    output_architecture=_output_arch or None,
                 )
                 follow_up.append({"role": "system", "content": synthesis_prompt})
 
@@ -1679,13 +1777,18 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     _r2_msg_count = _original_msgs
 
                 log.info(f"[{request_id}] Synthesis: depth={_search_depth} "
-                         f"analysis={_analysis_mode} blueprint={'yes' if _blueprint else 'no'} "
+                         f"analysis={_analysis_mode} "
+                         f"arch={'json' if _output_arch else ('legacy' if _blueprint else 'none')} "
                          f"ctx={_ctx_mode} r2_msgs={_r2_msg_count} "
                          f"prompt_len={len(synthesis_prompt)}")
 
                 # Assistant's tool call response (strip internal metadata)
                 _r2_content = response_content or ""
-                # Remove all metadata blocks — already extracted, waste tokens in R2
+                # Remove JSON architecture block — already extracted, waste tokens in R2
+                import re as _re
+                _r2_content = _re.sub(r'```json\s*\n?\{.*?\}\s*\n?```', '',
+                                      _r2_content, flags=_re.DOTALL).strip()
+                # Also strip legacy metadata blocks
                 for _strip_marker in ["ANALYSE-BLUEPRINT:", "ANALYSIS-BLUEPRINT:",
                                       "KONTEXT-EXTRAKT:", "CONTEXT-EXTRACT:",
                                       "KONTEXT-MODUS:", "CONTEXT-MODE:"]:
@@ -1724,6 +1827,47 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 log.info(f"[{request_id}] Tool call complete: {tools_used} | "
                          f"total_cost=${sum(cascade_costs):.6f}")
 
+                # ── Post-synthesis guard: catch JSON/blueprint in synthesis output ──
+                _synth_out = llm_result.get("content", "").strip()
+                if _synth_out.startswith("{") and _synth_out.endswith("}"):
+                    try:
+                        _synth_json = json.loads(_synth_out)
+                        _synth_keys = set(_synth_json.keys())
+                        _blueprint_keys = {"output_architecture", "query", "search_depth",
+                                           "context_mode", "context_extract"}
+                        if _synth_keys & _blueprint_keys:
+                            log.warning(f"[{request_id}] Synthesis returned JSON blueprint "
+                                        f"instead of answer (keys: {_synth_keys})")
+                            # Retry synthesis with explicit anti-JSON instruction
+                            _retry_follow = list(follow_up)
+                            _retry_follow.append({
+                                "role": "user",
+                                "content": (
+                                    "FEHLER: Du hast JSON statt einer Antwort ausgegeben. "
+                                    "Gib NIEMALS JSON, Code oder Metadaten als Antwort. "
+                                    "Beantworte die ursprüngliche Frage als normalen Text "
+                                    "mit konkreten Fakten aus den Suchergebnissen oben."
+                                ),
+                            })
+                            _retry_synth = await provider.chat(
+                                messages=[], model=model,
+                                max_tokens=max_output,
+                                temperature=request.temperature or 0.7,
+                                raw_messages=_retry_follow,
+                            )
+                            cascade_costs.append(_retry_synth.get("cost_usd", 0))
+                            cascade_tokens.append(
+                                _retry_synth["usage"].get("total_tokens", 0))
+                            _retry_text = _retry_synth.get("content", "").strip()
+                            if _retry_text and not _retry_text.startswith("{"):
+                                llm_result = _retry_synth
+                                log.info(f"[{request_id}] Synthesis retry succeeded: "
+                                         f"{len(_retry_text)} chars")
+                            else:
+                                log.warning(f"[{request_id}] Synthesis retry also JSON")
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # Not JSON, that's fine
+
             # Check for escalation markers (model chose not to use tools)
             elif ESCALATION_MARKER_PREMIUM in response_content:
                 escalated_to = "premium"
@@ -1753,6 +1897,242 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     escalated_to = "cheap_plus"
             elif ESCALATION_MARKER in response_content:
                 escalated_to = "medium"
+
+            # ── Guard: Hallucinated code/JSON instead of tool call ──
+            # Sometimes the model outputs Python code (e.g. print(default_api.web_search(...)))
+            # or raw JSON blueprints (e.g. {"query": "...", "search_depth": "medium"})
+            # or output_architecture JSON instead of actually calling tools.
+            # Detection: no tool_calls, response looks like code/JSON, not a real answer.
+            if not tool_calls and not escalated_to and response_content:
+                _hallucination_patterns = [
+                    "default_api.", "print(", ".web_search(", ".memory_search(",
+                    ".get_weather(", ".get_stock_price(", ".get_news(",
+                    "import requests", "requests.get(", "requests.post(",
+                    "api.search(", "api.query(",
+                ]
+                _rc_lower = response_content.lower().strip()
+                _rc_stripped = response_content.strip()
+                _is_hallucinated_code = (
+                    any(p.lower() in _rc_lower for p in _hallucination_patterns)
+                    and len(response_content) < 500  # Real answers are longer
+                    and ("(" in response_content and ")" in response_content)
+                )
+
+                # Also detect raw JSON output (model dumps blueprint instead of tool call)
+                # Patterns: {"query": "...", "search_depth": "..."} 
+                #           {"output_architecture": {...}}
+                _is_hallucinated_json = False
+                if _rc_stripped.startswith("{") and _rc_stripped.endswith("}"):
+                    try:
+                        _parsed_json = json.loads(_rc_stripped)
+                        _json_keys = set(_parsed_json.keys())
+                        # Known internal-only JSON patterns that should never be user-facing
+                        _internal_json_keys = {
+                            "query", "search_depth", "output_architecture",
+                            "context_mode", "context_extract", "tool_call",
+                        }
+                        if _json_keys & _internal_json_keys:
+                            _is_hallucinated_json = True
+                            log.warning(
+                                f"[{request_id}] Hallucinated JSON detected "
+                                f"(keys: {_json_keys}): '{_rc_stripped[:120]}'")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                if _is_hallucinated_code or _is_hallucinated_json:
+                    _hall_type = "JSON blueprint" if _is_hallucinated_json else "code"
+                    log.warning(
+                        f"[{request_id}] Hallucinated {_hall_type} detected: "
+                        f"'{response_content[:100]}' → retrying with reinforced prompt")
+                    metrics.increment("hallucinated_code_retries")
+
+                    # ── Fast path: if hallucinated JSON contains a query, execute it directly ──
+                    _direct_synthesis_done = False
+                    if _is_hallucinated_json:
+                        try:
+                            _hall_json = json.loads(_rc_stripped)
+                            _hall_query = _hall_json.get("query", "")
+                            _hall_depth = _hall_json.get("search_depth", "medium")
+                            _hall_arch = _hall_json.get("output_architecture")
+                            
+                            # If no query in JSON, use the user's original question
+                            if not _hall_query and _hall_arch:
+                                _hall_query = user_query
+                                log.info(f"[{request_id}] No query in JSON, using user query: "
+                                         f"'{_hall_query[:80]}'")
+                            
+                            if _hall_query:
+                                log.info(f"[{request_id}] Extracting query from hallucinated JSON: "
+                                         f"'{_hall_query}' (depth={_hall_depth})")
+                                # Map depth
+                                _depth_map = {"min": "snippets", "medium": "deep", "max": "thorough"}
+                                _actual_depth = _depth_map.get(_hall_depth, "deep")
+                                # Execute web search directly
+                                _ws_result = await tool_web_search(
+                                    query=_hall_query, depth=_actual_depth)
+                                if _ws_result and not _ws_result.startswith("Keine Ergebnisse"):
+                                    # Build synthesis directly
+                                    _synth_prompt = build_synthesis_prompt(
+                                        _actual_depth,
+                                        output_architecture=_hall_arch or {},
+                                    )
+                                    _synth_msgs = []
+                                    for m in trimmed_messages:
+                                        _synth_msgs.append(
+                                            {"role": m.role, "content": m.text_content})
+                                    _synth_msgs.append({
+                                        "role": "user",
+                                        "content": f"{_ws_result}\n\n{_synth_prompt}",
+                                    })
+                                    _synth_result = await provider.chat(
+                                        messages=[ChatMessage(**m) for m in _synth_msgs],
+                                        model=model,
+                                        max_tokens=max_output,
+                                        temperature=request.temperature or 0.7,
+                                        system_prompt=system_prompt,
+                                    )
+                                    cascade_costs.append(_synth_result.get("cost_usd", 0))
+                                    cascade_tokens.append(
+                                        _synth_result["usage"].get("total_tokens", 0))
+                                    _synth_content = _synth_result.get("content", "").strip()
+                                    if _synth_content and len(_synth_content) > 50:
+                                        log.info(f"[{request_id}] Direct JSON→search→synthesis: "
+                                                 f"{len(_synth_content)} chars")
+                                        response_content = _synth_content
+                                        llm_result = _synth_result
+                                        tool_calls = None  # Skip normal tool processing
+                                        # We'll handle source footer below
+                                        _direct_synthesis_done = True
+                        except (json.JSONDecodeError, TypeError, Exception) as e:
+                            log.warning(f"[{request_id}] Direct JSON extraction failed: {e}")
+                            _direct_synthesis_done = False
+                    else:
+                        _direct_synthesis_done = False
+
+                    if not _direct_synthesis_done:
+                        # Retry: add explicit "no code/JSON" instruction and resend
+                        _retry_msgs = list(trimmed_messages)
+                        _retry_msgs.append(ChatMessage(
+                            role="user",
+                            content=(
+                                "WICHTIG: Antworte als normaler Text. "
+                                "Gib KEINEN Python-Code, KEINE API-Aufrufe, KEIN print() aus. "
+                                "Gib KEIN rohes JSON aus — JSON ist nur für tool_calls, nicht für Textantworten. "
+                                "Wenn du eine Websuche brauchst, nutze das web_search Tool direkt als function call. "
+                                "Beantworte die Frage direkt."
+                            ),
+                        ))
+                        _retry_result = await provider.chat(
+                            messages=_retry_msgs,
+                            model=model,
+                            max_tokens=max_output,
+                            temperature=request.temperature or 0.7,
+                            system_prompt=system_prompt,
+                            tools=TOOL_DEFINITIONS if use_tools else None,
+                        )
+                        cascade_costs.append(_retry_result.get("cost_usd", 0))
+                        cascade_tokens.append(
+                            _retry_result["usage"].get("total_tokens", 0))
+
+                        # Check if retry produced tool calls or real text
+                        _retry_tools = _retry_result.get("tool_calls")
+                        _retry_content = _retry_result.get("content", "").strip()
+
+                        if _retry_tools:
+                            # Model now correctly uses tools — process them
+                            log.info(f"[{request_id}] Hallucination retry → "
+                                     f"model now calls tools: "
+                                     f"{[tc.get('function',{}).get('name','?') for tc in _retry_tools]}")
+                            llm_result = _retry_result
+                            tool_calls = _retry_tools
+                            response_content = _retry_content
+                            # Re-enter tool execution path
+                            tool_results = await execute_tool_calls(tool_calls)
+                            tools_used = [tr["name"] for tr in tool_results]
+
+                            # Build follow-up for synthesis
+                            follow_up = []
+                            _search_depth = "snippets"
+                            _analysis_mode = "factual"
+                            for tc in tool_calls:
+                                if tc.get("function", {}).get("name") == "web_search":
+                                    try:
+                                        _tc_args = json.loads(
+                                            tc.get("function", {}).get("arguments", "{}"))
+                                        _search_depth = _tc_args.get("search_depth",
+                                                        _tc_args.get("depth", "snippets"))
+                                        _depth_map = {"min": "snippets", "medium": "deep", "max": "thorough"}
+                                        _search_depth = _depth_map.get(_search_depth, _search_depth)
+                                        _analysis_mode = _tc_args.get("analysis_mode", "factual")
+                                    except (json.JSONDecodeError, AttributeError):
+                                        pass
+
+                            _output_arch = extract_output_architecture(response_content) if response_content else {}
+                            _blueprint = extract_blueprint(response_content) if (response_content and not _output_arch) else ""
+                            _ctx_strategy = extract_context_strategy(response_content) if response_content else {"mode": "full"}
+
+                            for m in trimmed_messages:
+                                follow_up.append({"role": m.role, "content": m.text_content})
+                            follow_up.append({
+                                "role": "assistant",
+                                "content": response_content or "Ich suche nach Informationen...",
+                                "tool_calls": [
+                                    {"id": tc.get("id", ""), "type": "function",
+                                     "function": tc.get("function", {})}
+                                    for tc in tool_calls
+                                ],
+                            })
+                            for tr in tool_results:
+                                log.info(f"[{request_id}] Tool result [{tr['name']}]: "
+                                         f"{tr['result'][:200]}...")
+                                follow_up.append({
+                                    "role": "tool",
+                                    "tool_call_id": tr["tool_call_id"],
+                                    "content": tr["result"],
+                                })
+
+                            synthesis_prompt = build_synthesis_prompt(
+                                _search_depth, _analysis_mode, _blueprint,
+                                output_architecture=_output_arch or None)
+                            if synthesis_prompt:
+                                follow_up.append({
+                                    "role": "user", "content": synthesis_prompt,
+                                })
+
+                            await asyncio.sleep(1.0)
+                            llm_result = await provider.chat(
+                                messages=[], model=model,
+                                max_tokens=max_output,
+                                temperature=request.temperature or 0.7,
+                                raw_messages=follow_up,
+                            )
+                            cascade_costs.append(llm_result.get("cost_usd", 0))
+                            cascade_tokens.append(
+                                llm_result["usage"].get("total_tokens", 0))
+                            log.info(f"[{request_id}] Hallucination retry → "
+                                     f"tool call complete: {tools_used}")
+
+                        elif not any(p.lower() in _retry_content.lower()
+                                     for p in _hallucination_patterns):
+                            # Also verify no JSON hallucination in retry
+                            _retry_is_json = (
+                                _retry_content.strip().startswith("{")
+                                and _retry_content.strip().endswith("}")
+                                and any(k in _retry_content for k in
+                                        ['"query"', '"output_architecture"', '"search_depth"'])
+                            )
+                            if _retry_is_json:
+                                log.warning(f"[{request_id}] Hallucination retry also "
+                                            f"produced JSON → using original")
+                            else:
+                                # Retry produced a real text answer
+                                log.info(f"[{request_id}] Hallucination retry → "
+                                         f"real text answer ({len(_retry_content)} chars)")
+                                llm_result = _retry_result
+                                response_content = _retry_content
+                        else:
+                            log.warning(f"[{request_id}] Hallucination retry also "
+                                        f"produced code → using original")
 
             if escalated_to:
                 log.info(f"[{request_id}] Cascade: cheap → {escalated_to}")
@@ -2219,8 +2599,83 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         budget_guard.record_spend(actual_cost)
         metrics.increment("total_cost_usd", actual_cost)
 
+        # Append source footer from web search (if enabled in config)
+        _final_content = llm_result["content"]
+        try:
+            _source_footer = get_last_source_footer()
+            if _source_footer and tools_used and "web_search" in tools_used:
+                import re as _re
+                
+                # Post-process: remove inline URL citations the model shouldn't have used
+                _final_content = _re.sub(
+                    r'\s*\(Quelle:\s*https?://[^)]+\)', '', _final_content)
+                _final_content = _re.sub(
+                    r'\s*\(Quelle:\s*[a-z0-9][a-z0-9.-]+\.[a-z]{2,}(?:\s*,\s*[a-z0-9.-]+\.[a-z]{2,})*\)',
+                    '', _final_content, flags=_re.IGNORECASE)
+                
+                # ── Strip lazy-response trailing sentences ──
+                # Model sometimes adds "Es ist ratsam, die Webseiten zu besuchen" etc.
+                _lazy_patterns = [
+                    r'\n+(?:Es ist ratsam|Bitte beachte|Es empfiehlt sich|Für aktuelle|'
+                    r'Es lohnt sich|Weitere Informationen|Für weitere|Besuchen Sie|'
+                    r'Für detaillierte)[^.]*\.\s*$',
+                ]
+                for lp in _lazy_patterns:
+                    _final_content = _re.sub(lp, '', _final_content)
+                
+                # ── Strip model-generated source sections ──
+                # The model sometimes generates its own "Quellen:" with hallucinated URLs.
+                # We replace them with our real footer from build_source_footer().
+                _source_section_patterns = [
+                    r'\n---\s*\n\*?\*?Quellen:?\*?\*?\s*\n.*',  # Our format + bold
+                    r'\nQuellen:\s*\n\[1\].*',                    # Standard
+                    r'\nSources:\s*\n\[1\].*',                    # English
+                    r'\nQuellen:\s*\n\*?\*?\[1\].*',              # Bold refs
+                    r'\n\*\*Quellen:?\*\*\s*\n.*',                # Bold header
+                    r'\n\*\*Sources:?\*\*\s*\n.*',                # Bold English
+                    r'\nQuellen:\s*\n[•\-].*',                    # Bullet format
+                    r'\nQuellen:\s*\n\d+\..*',                    # Numbered format
+                    r'\nQuellen:\s*\nhttps?://.*',                # Direct URLs
+                ]
+                for pattern in _source_section_patterns:
+                    _stripped = _re.sub(pattern, '', _final_content, flags=_re.DOTALL)
+                    if len(_stripped) < len(_final_content):
+                        log.info(f"[{request_id}] Stripped model-generated source section "
+                                 f"({len(_final_content) - len(_stripped)} chars)")
+                        _final_content = _stripped.rstrip()
+                        break
+                
+                # ── Validate inline references [N] ──
+                # Count real sources in the footer and strip refs that exceed the count.
+                _real_source_count = _source_footer.count("\n[")
+                if _real_source_count > 0:
+                    # Find all [N] references in the response
+                    _all_refs = set(int(m) for m in _re.findall(r'\[(\d+)\]', _final_content))
+                    _invalid_refs = {n for n in _all_refs if n > _real_source_count or n < 1}
+                    if _invalid_refs:
+                        log.warning(f"[{request_id}] Invalid source refs {_invalid_refs} "
+                                    f"(only {_real_source_count} real sources) → removing")
+                        for ref_num in _invalid_refs:
+                            _final_content = _final_content.replace(f"[{ref_num}]", "")
+                        # Clean up double spaces left behind
+                        _final_content = _re.sub(r'  +', ' ', _final_content)
+                
+                # Filter footer: only keep sources actually referenced in LLM response
+                # Also renumbers both text and footer for consistency
+                _final_content, _filtered_footer = _filter_source_footer(
+                    _final_content, _source_footer
+                )
+                if _filtered_footer:
+                    _final_content = _final_content.rstrip() + "\n" + _filtered_footer
+                    log.info(f"[{request_id}] Source footer appended "
+                             f"({_filtered_footer.count('[')}) sources, "
+                             f"filtered from {_source_footer.count('[')}")
+            clear_source_footer()
+        except Exception:
+            pass  # Source footer is optional, never fail on it
+
         # Store in caches (skip if no_cache mode)
-        response_data = {"content": llm_result["content"]}
+        response_data = {"content": _final_content}
 
         if config.cache.exact_cache_enabled and not no_cache:
             exact_cache.set(

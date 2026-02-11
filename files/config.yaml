@@ -80,3 +80,18 @@ security:
   require_api_key: true    # REQUIRED for public VPS!
   enable_policy_gate: true
   block_sensitive_data: true
+
+# ─── Web Search Pipeline ─────────────────────────────────────────────────────
+# Controls how web_search tool works (DDG/Google/Bing scraping, result counts, sources)
+web_search:
+  max_snippets: 5            # Max DDG snippet results per query (1-10)
+  min_pages: 2               # MINIMUM pages to always download (even for simple queries)
+  max_pages_deep: 5          # Full-text pages to download in 'deep' mode (1-8)
+  max_pages_thorough: 8      # Full-text pages to download in 'thorough' mode (1-10)
+  max_page_chars: 12000      # Max chars extracted per page (~3000 tokens). Higher = more content but more cost
+  page_fetch_timeout: 8.0    # Timeout per page fetch in seconds
+  show_sources: true         # Append source URLs as footnotes to LLM response
+  source_format: "footer"    # "footer" = [1] URL at end, "none" = disabled
+  engines: ["ddg"]           # Search engines (order = priority): "ddg", "google", "bing"
+  multi_query: true          # Allow model to issue multiple parallel search queries
+  max_queries: 3             # Max parallel queries per search call (1-5)

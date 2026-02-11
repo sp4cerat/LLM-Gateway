@@ -132,7 +132,7 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the web for ANY information using DuckDuckGo (free). "
+                "Search the web for ANY information using multiple search engines (free). "
                 "This is the PRIMARY tool for: fact-checking, research, regulations, "
                 "laws, 'ist es wahr/stimmt es', 'was gibt es zu [Thema]', product info, "
                 "company info, technology research, event listings, comparisons, "
@@ -145,11 +145,39 @@ TOOL_DEFINITIONS = [
                     "query": {
                         "type": "string",
                         "description": (
-                            "Search query. Be specific and include context. "
+                            "Primary search query. Be specific and include context. "
                             "Examples: 'BVB Ergebnis gestern', 'A8 Stau aktuell', "
                             "'EU Batterieverordnung 2026 Smartphone Akku Austausch', "
                             "'best restaurants Konstanz'"
                         ),
+                    },
+                    "additional_queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional: 1-2 additional search queries with DIFFERENT keywords "
+                            "to find complementary information. Only use for complex topics "
+                            "where a single query won't cover all aspects.\n"
+                            "Example for 'KI in der Medizin':\n"
+                            "  query: 'KI Diagnose Medizin Forschung 2025'\n"
+                            "  additional_queries: ['AI drug discovery clinical trials', "
+                            "'künstliche Intelligenz Gesundheitswesen Deutschland']\n"
+                            "For simple lookups, leave this empty."
+                        ),
+                    },
+                    "search_depth": {
+                        "type": "string",
+                        "description": (
+                            "How broad and deep to search — choose based on complexity:\n"
+                            "- 'min': Single query, snippets only. Fast (~1s). "
+                            "Use for: quick facts, scores, prices, simple lookups.\n"
+                            "- 'medium': 1-2 queries, download top pages (~3-5s). "
+                            "Use for: fact-checking, regulations, comparisons, detailed info.\n"
+                            "- 'max': 2-3 queries across multiple engines, thorough extraction (~5-10s). "
+                            "Use for: complex research, multi-source analysis, academic topics, "
+                            "legal questions, comprehensive comparisons."
+                        ),
+                        "enum": ["min", "medium", "max"],
                     },
                     "time_filter": {
                         "type": "string",
@@ -160,25 +188,10 @@ TOOL_DEFINITIONS = [
                             "- 'm': Last month. Use for: recent studies, policy changes, new products.\n"
                             "- 'none': No time limit. Use for: regulations, laws, research studies, "
                             "historical facts, established knowledge, 'Verordnung', academic topics.\n"
-                            "IMPORTANT: For deep/thorough research queries, prefer 'none' or 'm'. "
+                            "IMPORTANT: For medium/max research queries, prefer 'none' or 'm'. "
                             "Using 'd' or 'w' for research topics often returns NO useful results."
                         ),
                         "enum": ["d", "w", "m", "none"],
-                    },
-                    "depth": {
-                        "type": "string",
-                        "description": (
-                            "Search depth — how much web content to fetch:\n"
-                            "- 'snippets': Only search result snippets. Fast (~1s). "
-                            "Use for: simple lookups, quick facts, scores, weather, prices.\n"
-                            "- 'deep': Download top pages and extract full text (~3-5s). "
-                            "Use for: fact-checking, regulations, 'ist es wahr', detailed info, "
-                            "comparisons, product research, how-to guides.\n"
-                            "- 'thorough': Download more pages with more text (~5-10s). "
-                            "Use for: complex research, multi-source analysis, academic topics, "
-                            "detailed comparisons, legal/policy questions."
-                        ),
-                        "enum": ["snippets", "deep", "thorough"],
                     },
                     "analysis_mode": {
                         "type": "string",
@@ -193,16 +206,6 @@ TOOL_DEFINITIONS = [
                             "'Vergleich', multi-dimensional topics requiring structured frameworks."
                         ),
                         "enum": ["factual", "prognostic", "strategic"],
-                    },
-                    "max_pages": {
-                        "type": "integer",
-                        "description": (
-                            "How many web pages to download full text from (0-5). "
-                            "0 = snippets only (fastest). "
-                            "1-2 = quick deep search. "
-                            "3-5 = thorough research. "
-                            "Default: auto-determined from depth."
-                        ),
                     },
                 },
                 "required": ["query"],
@@ -239,21 +242,30 @@ CRITICAL RULES:
 - NEVER say "I will perform a search" — just DO the search by calling the tool
 - If a tool returns no relevant results, answer from your knowledge and say "based on my training data"
 
-WEB SEARCH DEPTH — choose the right depth for each query:
-  snippets (default, ~1s):
+WEB SEARCH DEPTH — choose search_depth based on complexity:
+  min (default, ~1s):
     Quick lookups, scores, prices, opening hours, simple facts.
+    Single query, snippets only. No page downloads.
     Examples: "BVB Ergebnis", "Bitcoin Kurs", "Öffnungszeiten IKEA Konstanz"
-  deep (3-5s, downloads 2-3 pages):
+  medium (3-5s, downloads pages):
     Fact-checking, regulations, "ist es wahr", detailed product/tech info,
     event details, how-to guides, policy questions.
+    1-2 queries, downloads top pages for full text.
     Examples: "EU Batterieverordnung 2026", "ist es wahr dass...", "Vergleich iPhone vs Samsung"
-  thorough (5-10s, downloads 4-5 pages):
-    Complex research, multi-source analysis, academic topics, legal deep-dives,
-    comprehensive comparisons, anything needing multiple perspectives.
+  max (5-10s, thorough multi-source):
+    Complex research, multi-source analysis, academic topics, legal deep-dives.
+    2-3 queries with DIFFERENT keywords across multiple search engines.
     Examples: "Auswirkungen KI auf Arbeitsmarkt 2025-2030", "Vor- und Nachteile Wärmepumpe vs Gas"
 
-  If unsure, prefer "deep" over "snippets" for any question longer than 10 words.
-  The max_pages parameter overrides the default page count for a depth level.
+  If unsure, prefer "medium" over "min" for any question longer than 10 words.
+
+MULTI-QUERY — for medium/max depth, use additional_queries with DIFFERENT keywords:
+  Example: User asks "Kann KI helfen FQAD zu heilen?"
+    query: "KI FQAD Fluoroquinolone Heilung Forschung"
+    additional_queries: ["AI fluoroquinolone toxicity treatment research",
+                         "FQAD mitochondrial damage therapy 2025"]
+  This finds complementary information that a single query would miss.
+  For min depth or simple lookups, don't use additional_queries.
 
 ANALYSIS MODE — choose the right analysis type:
   factual (default):
@@ -266,68 +278,102 @@ ANALYSIS MODE — choose the right analysis type:
     Requires: structured frameworks, economic reasoning, implementation reality.
     Use for: industry transformation, policy impact, complex comparisons.
 
-ANALYSIS BLUEPRINT — CRITICAL for deep/thorough searches:
-  IMPORTANT: When making a tool call, you MUST ALWAYS write content in your message
-  alongside the tool call. NEVER make a tool call with empty content.
+ANALYSIS BLUEPRINT — CRITICAL for medium/max searches:
+  IMPORTANT: You MUST ALWAYS make a web_search tool call when the user asks a question
+  that needs current information. The JSON blueprint goes IN ADDITION to the tool call,
+  NEVER instead of it.
 
-  When you call web_search with depth=deep or depth=thorough, your message content
-  MUST include a KONTEXT-EXTRAKT and an ANALYSE-BLUEPRINT block.
+  ⚠️ CRITICAL: NEVER output raw JSON as your response text. JSON is ONLY for the content
+  field alongside a tool_call. If you find yourself writing {"query":... or {"output_architecture":...
+  as your entire response, STOP — that is WRONG. You must make an actual tool call.
 
-  Format your message content like this:
+  When you call web_search with search_depth=medium or search_depth=max, your message
+  content MUST include a JSON block wrapped in ```json markers with this EXACT structure:
 
-  KONTEXT-EXTRAKT:
-  [relevant facts from conversation history, or "Kein relevanter Kontext"]
+  ```json
+  {
+    "output_architecture": {
+      "framework": "factual|prognostic|strategic",
+      "language": "de|en",
+      "reasoning": "Brief: why this framework + depth for this query",
+      "required_data": ["specific data points that MUST appear in the answer"],
+      "outline": [
+        "**Main title**",
+        "**First major section**",
+        "**Subsection if needed**",
+        "**Second major section**",
+        "**Conclusion / Critical assessment**"
+      ],
+      "source_priority": ["what kind of sources to prefer"]
+    },
+    "context_mode": "full|recent:N|distill",
+    "context_extract": "relevant facts from conversation or null"
+  }
+  ```
 
-  ANALYSE-BLUEPRINT:
-  Typ: [factual/prognostic/strategic]
-  Pflicht-Dimensionen: [list the 3-6 dimensions that MUST be covered]
-  Quantitative Pflicht: [what numbers/metrics MUST be included]
-  Struktur: [the section structure for the final answer]
-  Quellen-Priorität: [what kind of sources to prioritize]
+  RULES for output_architecture:
+  - "framework": matches analysis_mode — factual for facts, prognostic for forecasts, strategic for deep analysis
+  - "language": detect from user's query (German → "de", English → "en")
+  - "reasoning": 1 sentence explaining why you chose this framework and depth
+  - "required_data": 3-8 specific data points/metrics that the answer MUST contain
+    Examples: "Automatisierungsquote (%)", "Marktvolumen in Mrd. EUR", "Adoptionsrate 2025 vs 2030"
+  - "outline": structure using **bold** headings for the final answer (4-8 entries)
+    Use "**Title**" for headings on their own line
+    The synthesis step will follow this outline EXACTLY
+  - "source_priority": ordered list of preferred source types
+    Examples: ["Studien (McKinsey, OECD)", "Ministerien", "Fachpresse"]
 
   Example for "Auswirkungen KI auf Arbeitsmarkt 2025-2030":
 
-  KONTEXT-EXTRAKT:
-  Kein relevanter Kontext
+  ```json
+  {
+    "output_architecture": {
+      "framework": "prognostic",
+      "language": "de",
+      "reasoning": "Zukunftsbezogene Frage mit Zeithorizont erfordert Prognose-Framework",
+      "required_data": [
+        "Automatisierungsquote nach Branche (%)",
+        "Netto-Beschäftigungseffekt (Mio. Jobs)",
+        "Produktivitätswachstum (%)",
+        "Investitionsvolumen KI (Mrd. EUR/USD)",
+        "Zeithorizonte der Prognosen"
+      ],
+      "outline": [
+        "**KI und Arbeitsmarkt 2025-2030**",
+        "**Leitthese**",
+        "**Automatisierung & Substitution**",
+        "**Augmentation & neue Berufe**",
+        "**Branchenspezifische Effekte**",
+        "**Qualifikationsdynamik & Skills Gap**",
+        "**Makroökonomische Effekte**",
+        "**Kritische Einordnung & Unsicherheiten**"
+      ],
+      "source_priority": ["Studien (McKinsey, OECD, IAB, Goldman Sachs)", "Ministerien (BMAS)", "Fachpresse"]
+    },
+    "context_mode": "distill",
+    "context_extract": "Kein relevanter Kontext"
+  }
+  ```
 
-  ANALYSE-BLUEPRINT:
-  Typ: prognostic
-  Pflicht-Dimensionen: Automatisierungspotenzial, Beschäftigungsbilanz, Branchenunterschiede, Skills Gap, Produktivitätseffekte, Regulierung
-  Quantitative Pflicht: Automatisierungsquote (%), Beschäftigungseffekt (Mio Jobs), Produktivitätswachstum (%), Investitionsvolumen
-  Struktur: 1. Automatisierung & Substitution, 2. Augmentation & neue Jobs, 3. Branchenanalyse, 4. Qualifikationsdynamik, 5. Makroökonomische Effekte, 6. Regulatorische Einordnung, 7. Kritische Bewertung
-  Quellen-Priorität: Studien (McKinsey, OECD, IAB, Goldman Sachs) > Ministerien (BMAS, BMWi) > Fachpresse > Zeitungsartikel
+  For min depth (simple lookups), you do NOT need output_architecture — just call the tool.
+  
+  REMINDER: Your response to information questions MUST contain a tool_call to web_search.
+  Writing JSON text without a tool_call is NEVER correct.
 
-CONTEXT STRATEGY — decide how much conversation history the synthesis step needs:
-  When making a tool call, you MUST decide how much conversation context is needed
-  for the synthesis step. Output a KONTEXT-MODUS line in your message content.
+CONTEXT STRATEGY — the "context_mode" field in your JSON controls conversation history:
+  "full"        → Full conversation history passed to synthesis (default)
+  "recent:N"    → Only last N user+assistant pairs (e.g. "recent:2")
+  "distill"     → Only your context_extract is passed (saves tokens for long chats)
 
-  Three modes:
+  When to use:
+  - Code, debugging, file analysis → "full"
+  - Research after long chat → "distill" + provide context_extract
+  - Simple follow-up → "recent:2" or "recent:3"
+  - First message / short chat → "full"
+  - If unsure → "full"
 
-  KONTEXT-MODUS: full
-    Use when: code/debugging, document analysis, complex multi-turn where details matter,
-    user references specific earlier content, attachments/files discussed.
-    Effect: Full conversation history is passed to synthesis step.
-
-  KONTEXT-MODUS: recent:N    (N = number of message pairs, 1-10)
-    Use when: simple follow-up questions, the relevant context is in the last few messages.
-    Examples: "und was kostet das?" after discussing a product → recent:2
-    Effect: Only last N user+assistant pairs passed to synthesis.
-
-  KONTEXT-MODUS: distill
-    Use when: standalone research questions, long conversation history but current question
-    is independent, web search queries that don't need prior conversation context.
-    Effect: Only a compact fact extract is passed (you provide this as KONTEXT-EXTRAKT).
-    IMPORTANT: When using distill mode, you MUST also output a KONTEXT-EXTRAKT block:
-
-    KONTEXT-EXTRAKT:
-    [2-5 bullet points with relevant facts, or "Kein relevanter Kontext"]
-
-  Decision guide:
-  - First message in conversation → full (costs nothing extra)
-  - Code, debugging, file analysis → ALWAYS full
-  - Research/web search after long chat → distill (saves thousands of tokens)
-  - "was war nochmal..." / simple follow-up → recent:2 or recent:3
-  - If unsure → full (safe default, never loses information)
+  When using "distill", write 2-5 bullet points in context_extract with relevant facts.
+  When using "full" or "recent", set context_extract to null.
 
 SEARCH QUERY STRATEGY — optimize your search terms:
   For deep/thorough searches, use STUDY-ORIENTED search terms:
@@ -555,6 +601,7 @@ def build_synthesis_prompt(
     depth: str = "snippets",
     analysis_mode: str = "factual",
     blueprint: str = "",
+    output_architecture: dict = None,
 ) -> str:
     """
     Build a dynamic synthesis prompt from Round 1 parameters.
@@ -562,11 +609,16 @@ def build_synthesis_prompt(
     Args:
         depth: snippets/deep/thorough
         analysis_mode: factual/prognostic/strategic
-        blueprint: The ANALYSE-BLUEPRINT text generated by Round 1 (may be empty)
+        blueprint: Legacy ANALYSE-BLUEPRINT text (may be empty)
+        output_architecture: Structured JSON dict from Round 1 (preferred over blueprint)
     """
     # Snippets → simple prompt, no framework needed
-    if depth == "snippets" and not blueprint:
+    if depth == "snippets" and not blueprint and not output_architecture:
         return SYNTHESIS_PROMPT_SIMPLE
+
+    # If we have structured architecture, use its framework setting
+    if output_architecture and output_architecture.get("framework"):
+        analysis_mode = output_architecture["framework"]
 
     # Select analysis framework
     frameworks = {
@@ -592,8 +644,53 @@ def build_synthesis_prompt(
     # Analysis framework
     parts.append(framework)
 
-    # Blueprint from Round 1 (if available — this is the key architecture improvement)
-    if blueprint:
+    # ── Structured output architecture (preferred) ──
+    if output_architecture:
+        arch_parts = []
+        arch_parts.append("\nOUTPUT-ARCHITEKTUR (ZWINGEND — befolge diese Struktur exakt):")
+
+        if output_architecture.get("reasoning"):
+            arch_parts.append(f"Begründung: {output_architecture['reasoning']}")
+
+        if output_architecture.get("required_data"):
+            data_items = output_architecture["required_data"]
+            arch_parts.append(f"\nPFLICHT-DATENPUNKTE (diese Daten MÜSSEN in der Antwort vorkommen):")
+            for i, d in enumerate(data_items, 1):
+                arch_parts.append(f"  {i}. {d}")
+
+        if output_architecture.get("outline"):
+            outline = output_architecture["outline"]
+            arch_parts.append(f"\nGLIEDERUNG (folge dieser Struktur EXAKT — verwende **Fettschrift** für Überschriften):")
+            for entry in outline:
+                # Normalize any format to **bold**
+                e = entry.strip()
+                # Strip legacy H1:/H2:/H3: prefixes
+                if e.startswith("H1:") or e.startswith("H1 "):
+                    e = e.split(":", 1)[-1].strip()
+                elif e.startswith("H2:") or e.startswith("H2 "):
+                    e = e.split(":", 1)[-1].strip()
+                elif e.startswith("H3:") or e.startswith("H3 "):
+                    e = e.split(":", 1)[-1].strip()
+                # Strip markdown heading markers
+                e = e.lstrip("#").strip()
+                # Ensure bold formatting
+                if not e.startswith("**"):
+                    e = f"**{e}**"
+                arch_parts.append(f"  {e}")
+
+        if output_architecture.get("source_priority"):
+            prio = output_architecture["source_priority"]
+            arch_parts.append(f"\nQUELLEN-PRIORITÄT: {' > '.join(prio)}")
+
+        # Detect language from architecture
+        lang = output_architecture.get("language", "de")
+        if lang == "en":
+            arch_parts.append("\nRESPOND IN ENGLISH.")
+
+        parts.append("\n".join(arch_parts))
+
+    # ── Legacy blueprint fallback ──
+    elif blueprint:
         parts.append(f"""
 ANALYSE-BLUEPRINT (aus der Recherche-Planung — befolge diese Vorgaben ZWINGEND):
 {blueprint}
@@ -608,21 +705,88 @@ SYNTHESE-REGELN:
 - Strukturiere nach THEMATISCHEN ASPEKTEN, nicht nach Quellen
 - Quantitativ > qualitativ ("25-30%" statt "erheblich")
 - Studien/Reports > Zeitungsartikel > Meinungsbeiträge
-- Quellenangaben inline ("laut OECD...", "McKinsey schätzt...")
 - Antworte in der Sprache des Nutzers
 - Keine Code-Blöcke, keine API-Aufrufe
+
+INHALT — ABSOLUT ZWINGEND:
+- Du MUSST konkrete Informationen aus den Quellen extrahieren und aufführen
+- NIEMALS schreiben "besuchen Sie die Webseite für mehr Details" oder "müsste ich detaillierter durchsuchen"
+- NIEMALS schreiben "die Webseite listet X Veranstaltungen" — stattdessen die Veranstaltungen SELBST auflisten
+- NIEMALS nur Webseiten empfehlen statt Inhalte zu liefern
+- Wenn eine Quelle "Konzert X am 15.02. um 20:00 Uhr" enthält, dann SCHREIBE das in deine Antwort
+- Wenn du aus den Quellen keine konkreten Details extrahieren kannst, nutze dein Trainingswissen
+- Jede Überschrift MUSS mindestens einen konkreten Inhaltspunkt darunter haben — leere Sektionen sind VERBOTEN
+- Lieber weniger Überschriften mit echtem Inhalt als viele leere Sektionen
+
+⚠️ QUELLENREFERENZEN — EXTREM WICHTIG:
+- [1], [2] etc. dürfen NUR auf tatsächlich vorhandene Quellen oben verweisen
+- ERFINDE NIEMALS [N]-Referenzen für Informationen die nicht in den Quellen stehen
+- Informationen aus deinem Trainingswissen OHNE [N]-Referenz schreiben
+- Am Ende KEIN eigenes "Quellen:" Verzeichnis erstellen — das wird automatisch angehängt
+- Wenn du nur 3 Quellen hast, darfst du maximal [1], [2], [3] verwenden — NIEMALS [4], [5], [6]
+
+⚠️ ANTI-HALLUZINATION:
+- ERFINDE KEINE Events, URLs, Termine oder Fakten die nicht in den Quellen stehen
+- Wenn die Quellen wenig hergeben: sage ehrlich was du weißt und was du nicht bestätigen kannst
+- Lieber weniger aber korrekte Informationen als viele erfundene Details
+
+ANTI-FAULHEITS-CHECK: Wenn deine Antwort die Wörter "empfiehlt es sich", "ratsam", "detaillierter durchsuchen",
+"besuchen Sie", "für mehr Informationen", "genannten Webseiten" oder "Nicht gefunden" enthält, ist sie FALSCH.
+Der Nutzer will ANTWORTEN, keine Links zum Selbstsuchen.
+
+FORMATIERUNG — ZWINGEND:
+- Überschriften als **Fettschrift** formatieren: "**Titel**" auf einer eigenen Zeile
+- Unterüberschriften ebenfalls fett: "**Untertitel**"
+- Nach jeder Überschrift eine Leerzeile
+- Bullet Points mit "•" für Listen
+- KEINE Markdown-Heading-Syntax (kein #, ##, ###)
+- Beispiel einer GUTEN Antwort:
+
+  **Veranstaltungen in Stuttgart nächste Woche**
+
+  **Konzerte**
+
+  • Tarja — Living the Dream Tour am 13.02. um 20:00 Uhr, Porsche Arena [3]
+  • Mother Black Cat am 15.02. um 20:30 Uhr, Nürtingen [3]
+
+  **Ausstellungen**
+
+  • MARVEL: Universe of Super Heroes, täglich ab 10:00 Uhr in Ludwigsburg. Tickets ab 22€ [2]
+
+- Beispiel einer SCHLECHTEN Antwort (VERMEIDE):
+
+  Auf eventfinder.de finden sich zahlreiche Veranstaltungen für nächste Woche.
+  Für detaillierte Informationen besuchen Sie visitberlin.de.
+
+QUELLENREFERENZEN — ZWINGEND:
+- Referenziere Quellen als Nummern in eckigen Klammern: [1], [2], [3]
+- Setze die Nummer NACH dem Satz oder Fakt: "Konzert am 13.02. um 20:00 Uhr [1]"
+- NIEMALS Quellennamen oder URLs inline schreiben
+- NIEMALS "(Quelle: eventfinder.de)" oder "(Quelle: https://...)" — NUR [1], [2] etc.
+- Die Nummern entsprechen der Reihenfolge der Quellen die du erhältst
+- Referenziere NUR Quellen die du tatsächlich inhaltlich verwendest
 
 VERMEIDE:
 - Quellenweise Zusammenfassung ("Quelle 1 sagt X, Quelle 2 sagt Y")
 - Vage Qualifier wenn Zahlen in den Quellen verfügbar sind
 - Redundante Wiederholungen
-- Journalistische Oberflächlichkeit
+- Plain-text Überschriften ohne Fettschrift
+- Markdown-Heading-Syntax (#, ##, ###)
+- Quellen als Text/URLs statt Nummern
+- Leere Abschnitte ohne konkreten Inhalt
+- Verweise auf Webseiten statt eigener Inhaltsextraktion
+- EIGENES Quellenverzeichnis am Ende — KEIN "Quellen:" Abschnitt mit URLs generieren!
+  Die Quellenliste wird AUTOMATISCH angehängt. Du schreibst NUR [1], [2] etc. inline.
+- ERFUNDENE Informationen: Wenn du keine konkreten Daten aus den Quellen hast,
+  nutze Trainingswissen, aber erfinde KEINE URLs, Termine oder Fakten.
+  Schreibe lieber "basierend auf allgemeinen Informationen" statt eine fake URL zu zitieren.
 
 WENN DIE SUCHERGEBNISSE IRRELEVANT ODER UNZUREICHEND SIND:
 - Nutze dein Trainingswissen, um die Frage trotzdem fundiert zu beantworten
 - Sage am Anfang kurz: "Die Webrecherche lieferte keine aktuellen Studien. Basierend auf meinem Wissensstand:" und beantworte dann die Frage vollständig
 - Gib NIEMALS auf und sage nur "keine Ergebnisse gefunden" — beantworte die Frage IMMER
-- Kombiniere Suchergebnisse (soweit relevant) mit Trainingswissen für die beste Antwort""")
+- Kombiniere Suchergebnisse (soweit relevant) mit Trainingswissen für die beste Antwort
+- ERFINDE KEINE Quellen-Nummern für Trainingswissen — nur echte Suchergebnisse referenzieren""")
 
     # Self-review for deep/thorough
     if depth in ("deep", "thorough"):
@@ -649,18 +813,126 @@ def _extract_block(content: str, markers: list[str], end_markers: list[str]) -> 
 
 
 def extract_blueprint(content: str) -> str:
-    """Extract ANALYSE-BLUEPRINT block from Round 1 assistant content."""
-    return _extract_block(
+    """Extract ANALYSE-BLUEPRINT block from Round 1 assistant content.
+    Legacy fallback — tries old free-text format first, then JSON."""
+    # Try old format first (backward compat)
+    old_bp = _extract_block(
         content,
         markers=["ANALYSE-BLUEPRINT:", "ANALYSIS-BLUEPRINT:", "BLUEPRINT:"],
         end_markers=["\n\n\n", "\nKONTEXT-MODUS:", "\nKONTEXT-EXTRAKT:",
                      "\nSEARCH", "\nANALYSIS"],
     )
+    if old_bp:
+        return old_bp
+
+    # Try extracting from JSON output_architecture
+    arch = extract_output_architecture(content)
+    if arch:
+        # Convert structured JSON to blueprint text for backward compat
+        parts = []
+        if arch.get("framework"):
+            parts.append(f"Typ: {arch['framework']}")
+        if arch.get("required_data"):
+            parts.append(f"Quantitative Pflicht: {', '.join(arch['required_data'])}")
+        if arch.get("outline"):
+            # Convert H1/H2/H3 or markdown headings to plain section names
+            sections = []
+            for o in arch["outline"]:
+                o = o.strip()
+                # Strip markdown heading markers
+                if o.startswith("### "):
+                    o = o[4:]
+                elif o.startswith("## "):
+                    o = o[3:]
+                elif o.startswith("# "):
+                    o = o[2:]
+                # Strip legacy H1:/H2:/H3: markers
+                elif ": " in o and o[:3] in ("H1:", "H2:", "H3:"):
+                    o = o.split(": ", 1)[-1]
+                sections.append(o.strip())
+            parts.append(f"Struktur: {', '.join(sections)}")
+        if arch.get("source_priority"):
+            parts.append(f"Quellen-Priorität: {' > '.join(arch['source_priority'])}")
+        return "\n".join(parts)
+
+    return ""
+
+
+def extract_output_architecture(content: str) -> dict:
+    """
+    Extract structured output_architecture JSON from Round 1 assistant content.
+
+    The model outputs a JSON block in ```json ... ``` markers containing:
+    {
+        "output_architecture": {
+            "framework": "factual|prognostic|strategic",
+            "language": "de|en",
+            "reasoning": "...",
+            "required_data": ["..."],
+            "outline": ["H1: ...", "H2: ...", ...],
+            "source_priority": ["..."]
+        },
+        "context_mode": "full|recent:N|distill",
+        "context_extract": "..." or null
+    }
+
+    Returns the output_architecture dict, or {} if not found.
+    """
+    if not content:
+        return {}
+
+    import json as _json
+    import re
+
+    # Try to find JSON block in ```json ... ``` markers
+    json_match = re.search(r'```json\s*\n?(.*?)\n?```', content, re.DOTALL)
+    if json_match:
+        json_str = json_match.group(1).strip()
+    else:
+        # Fallback: try to find raw JSON with output_architecture key
+        json_match = re.search(r'\{[^{}]*"output_architecture"[^{}]*\{.*?\}[^{}]*\}',
+                               content, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+        else:
+            return {}
+
+    try:
+        data = _json.loads(json_str)
+        arch = data.get("output_architecture", {})
+        if isinstance(arch, dict) and arch:
+            return arch
+    except (_json.JSONDecodeError, ValueError, TypeError) as e:
+        log.debug(f"JSON parse failed for output_architecture: {e}")
+
+    return {}
+
+
+def extract_full_r1_json(content: str) -> dict:
+    """
+    Extract the full Round 1 JSON block (output_architecture + context_mode + context_extract).
+    Returns the complete parsed dict, or {} if not found.
+    """
+    if not content:
+        return {}
+
+    import json as _json
+    import re
+
+    json_match = re.search(r'```json\s*\n?(.*?)\n?```', content, re.DOTALL)
+    if json_match:
+        try:
+            return _json.loads(json_match.group(1).strip())
+        except (_json.JSONDecodeError, ValueError):
+            pass
+
+    return {}
 
 
 def extract_context_strategy(content: str) -> dict:
     """
-    Extract KONTEXT-MODUS and optional KONTEXT-EXTRAKT from Round 1 content.
+    Extract context strategy from Round 1 content.
+    Supports both new JSON format and legacy KONTEXT-MODUS text format.
 
     Returns dict with:
         mode: "full" | "recent" | "distill"
@@ -674,7 +946,30 @@ def extract_context_strategy(content: str) -> dict:
     if not content:
         return result
 
-    # Parse KONTEXT-MODUS line
+    # ── Try new JSON format first ──
+    r1_json = extract_full_r1_json(content)
+    if r1_json:
+        ctx_mode = r1_json.get("context_mode", "full")
+        ctx_extract = r1_json.get("context_extract") or ""
+
+        if ctx_mode == "full":
+            result["mode"] = "full"
+        elif ctx_mode.startswith("recent"):
+            result["mode"] = "recent"
+            # Parse "recent:3" → 3
+            match = re.match(r'recent:?(\d+)?', ctx_mode)
+            n = int(match.group(1)) if match and match.group(1) else 3
+            result["recent_n"] = max(1, min(n, 50))
+        elif ctx_mode == "distill":
+            result["mode"] = "distill"
+            skip_phrases = ["kein relevanter kontext", "no relevant context",
+                            "nicht relevant", "standalone", "null"]
+            if ctx_extract and not any(p in ctx_extract.lower() for p in skip_phrases):
+                result["distill_text"] = ctx_extract
+
+        return result
+
+    # ── Fallback: legacy KONTEXT-MODUS text format ──
     match = re.search(
         r'KONTEXT-MODUS:\s*(full|recent(?::(\d+))?|distill)',
         content, re.IGNORECASE,
@@ -686,15 +981,15 @@ def extract_context_strategy(content: str) -> dict:
         elif mode_str.startswith("recent"):
             result["mode"] = "recent"
             n = int(match.group(2)) if match.group(2) else 3
-            result["recent_n"] = max(1, min(n, 50))  # Clamp 1-50
+            result["recent_n"] = max(1, min(n, 50))
         elif mode_str == "distill":
             result["mode"] = "distill"
-            # Extract the distillation text
             distill_text = _extract_block(
                 content,
                 markers=["KONTEXT-EXTRAKT:", "CONTEXT-EXTRACT:"],
                 end_markers=["\n\n\n", "\nANALYSE-BLUEPRINT:", "\nBLUEPRINT:",
-                             "\nKONTEXT-MODUS:", "\nSEARCH", "\nANALYSIS"],
+                             "\nKONTEXT-MODUS:", "\nSEARCH", "\nANALYSIS",
+                             "\n```"],
             )
             skip_phrases = ["kein relevanter kontext", "no relevant context",
                             "nicht relevant", "standalone", "nicht benötigt"]
@@ -718,54 +1013,110 @@ def generate_auto_blueprint(query: str, analysis_mode: str = "factual") -> str:
     """
     Generate a reasonable default blueprint when Round 1 didn't produce one.
     This is a fallback for when Gemini generates content_len=0 with tool calls.
+    Returns a text blueprint for backward compatibility.
+    """
+    arch = generate_auto_architecture(query, analysis_mode)
+    # Convert to text for backward compat with build_synthesis_prompt blueprint param
+    parts = []
+    if arch.get("framework"):
+        parts.append(f"Typ: {arch['framework']}")
+    if arch.get("required_data"):
+        parts.append(f"Quantitative Pflicht: {', '.join(arch['required_data'])}")
+    if arch.get("outline"):
+        sections = [o.split(": ", 1)[-1] if ": " in o else o for o in arch["outline"]]
+        parts.append(f"Struktur: {', '.join(sections)}")
+    if arch.get("source_priority"):
+        parts.append(f"Quellen-Priorität: {' > '.join(arch['source_priority'])}")
+    return "\n".join(parts)
+
+
+def generate_auto_architecture(query: str, analysis_mode: str = "factual") -> dict:
+    """
+    Generate a reasonable default output_architecture when Round 1 didn't produce one.
+    Returns a structured dict matching the output_architecture format.
     """
     if analysis_mode == "strategic":
-        return (
-            "Typ: strategic\n"
-            "Pflicht-Dimensionen: Technologische Anwendungen, Produktivitätshebel, "
-            "Markt & Investitionsdynamik, Arbeitsmarkt/Organisation, "
-            "Wettbewerbs-/Strukturveränderungen, Regulierung, "
-            "Implementierungshürden, Zeitachse\n"
-            "Quantitative Pflicht: Marktvolumen/CAGR, Produktivitäts-/Kosteneffekte (%), "
-            "Investitionsvolumen, Adoptionsraten — mind. 5 Zahlen\n"
-            "Pflicht-Abschnitte: Leitthese (1. Absatz), Wirtschaftliche Hebel "
-            "(Margen, Kosten, neue Geschäftsmodelle, Gewinner/Verlierer), "
-            "Realitätscheck (Barrieren, Regulierung, Kapital)\n"
-            "Struktur: 1. Leitthese, 2. Wertschöpfungskette & Markt, "
-            "3. Branchen-/Segmentanalyse, 4. Wirtschaftliche Hebel, "
-            "5. Zeitachse (Early/Main/Mature), 6. Regulierung, "
-            "7. Realitätscheck & Kritische Einordnung\n"
-            "Quellen-Priorität: Beratungsstudien (McKinsey, BCG) > "
-            "Think-Tanks (WEF, OECD) > Marktanalysen (Gartner, IDC) > "
-            "Forschungsinstitute > Ministerien > Fachpresse"
-        )
+        return {
+            "framework": "strategic",
+            "language": "de",
+            "reasoning": "Auto-generated: complex analytical query requires strategic framework",
+            "required_data": [
+                "Marktvolumen/CAGR",
+                "Produktivitäts-/Kosteneffekte (%)",
+                "Investitionsvolumen",
+                "Adoptionsraten",
+                "Zeithorizonte",
+            ],
+            "outline": [
+                "H1: Analyse",
+                "H2: Leitthese",
+                "H2: Wertschöpfungskette & Markt",
+                "H2: Branchen-/Segmentanalyse",
+                "H2: Wirtschaftliche Hebel",
+                "H2: Zeitachse (Early/Main/Mature)",
+                "H2: Regulierung & Implementierung",
+                "H2: Kritische Einordnung",
+            ],
+            "source_priority": [
+                "Beratungsstudien (McKinsey, BCG)",
+                "Think-Tanks (WEF, OECD)",
+                "Marktanalysen (Gartner, IDC)",
+                "Forschungsinstitute",
+                "Fachpresse",
+            ],
+        }
     elif analysis_mode == "prognostic":
-        return (
-            "Typ: prognostic\n"
-            "Pflicht-Dimensionen: Aktueller Stand, Prognose-Konsens, "
-            "Treiber & Hemmnisse, Wirtschaftliche Hebel, "
-            "Brancheneffekte, Zeitachse, Unsicherheiten\n"
-            "Quantitative Pflicht: Wachstumsraten (%), Marktprognosen, "
-            "Kosteneffekte, Zeithorizonte — mind. 3-5 Zahlen\n"
-            "Pflicht-Abschnitte: Leitthese (1. Absatz), Wirtschaftliche Hebel "
-            "(Kosten, Margen, neue Geschäftsmodelle, Gewinner/Verlierer)\n"
-            "Struktur: 1. Leitthese, 2. Status Quo & Treiber, "
-            "3. Kurzfrist (1-2J), 4. Mittelfrist (3-5J), "
-            "5. Langfrist (5-10J), 6. Wirtschaftliche Hebel, "
-            "7. Szenarien & Unsicherheiten\n"
-            "Quellen-Priorität: Beratungsstudien > Think-Tanks > "
-            "Marktanalysen > Forschungsinstitute > Fachpresse"
-        )
+        return {
+            "framework": "prognostic",
+            "language": "de",
+            "reasoning": "Auto-generated: forecasting query requires prognostic framework",
+            "required_data": [
+                "Wachstumsraten (%)",
+                "Marktprognosen",
+                "Kosteneffekte",
+                "Zeithorizonte",
+            ],
+            "outline": [
+                "H1: Prognose",
+                "H2: Leitthese",
+                "H2: Status Quo & Treiber",
+                "H2: Kurzfrist (1-2 Jahre)",
+                "H2: Mittelfrist (3-5 Jahre)",
+                "H2: Langfrist (5-10 Jahre)",
+                "H2: Wirtschaftliche Hebel",
+                "H2: Szenarien & Unsicherheiten",
+            ],
+            "source_priority": [
+                "Beratungsstudien",
+                "Think-Tanks",
+                "Marktanalysen",
+                "Forschungsinstitute",
+                "Fachpresse",
+            ],
+        }
     else:  # factual
-        return (
-            "Typ: factual\n"
-            "Pflicht-Dimensionen: Fakten, Regelungen, Ausnahmen, Quellen\n"
-            "Quantitative Pflicht: konkrete Zahlen, Daten, Fristen soweit verfügbar\n"
-            "Struktur: 1. Kernaussage, 2. Details & Regelungen, "
-            "3. Ausnahmen/Einschränkungen, 4. Quellen\n"
-            "Quellen-Priorität: Offizielle Quellen (Gesetze, Verordnungen) > "
-            "Fachmedien > Allgemeinpresse"
-        )
+        return {
+            "framework": "factual",
+            "language": "de",
+            "reasoning": "Auto-generated: factual query requires direct answer structure",
+            "required_data": [
+                "konkrete Zahlen/Daten",
+                "Fristen/Termine",
+                "Regelungen/Ausnahmen",
+            ],
+            "outline": [
+                "H1: Antwort",
+                "H2: Kernaussage",
+                "H2: Details & Regelungen",
+                "H2: Ausnahmen/Einschränkungen",
+                "H2: Quellen",
+            ],
+            "source_priority": [
+                "Offizielle Quellen (Gesetze, Verordnungen)",
+                "Fachmedien",
+                "Allgemeinpresse",
+            ],
+        }
 
 
 # Legacy compatibility: static map (used if blueprint extraction fails)
@@ -1050,56 +1401,254 @@ async def _newsapi_fetch(query: str, language: str, api_key: str) -> Optional[st
 async def tool_web_search(
     query: str, time_filter: str = "w",
     depth: str = "snippets", max_pages: Optional[int] = None,
+    additional_queries: Optional[list[str]] = None,
+    search_depth: Optional[str] = None,
 ) -> str:
-    """Execute web_search tool with configurable depth and analytical framing."""
-    # Resolve max_pages from depth if not explicitly set
-    DEPTH_DEFAULTS = {"snippets": 0, "deep": 3, "thorough": 5}
-    if max_pages is None:
-        max_pages = DEPTH_DEFAULTS.get(depth, 0)
-    max_pages = max(0, min(5, max_pages))  # Clamp 0-5
+    """Execute web_search tool with multi-engine, multi-query, and source tracking.
 
-    # Convert "none" string to actual None for DDG API
+    The search_depth parameter (min/medium/max) maps to the old depth system:
+      min    → snippets (0 pages)
+      medium → deep (config.max_pages_deep pages)
+      max    → thorough (config.max_pages_thorough pages, multi-engine)
+    """
+    # ── Load config ──
+    try:
+        from config import load_config
+        ws_cfg = load_config().web_search
+    except Exception:
+        from models import WebSearchConfig
+        ws_cfg = WebSearchConfig()
+
+    # ── Map search_depth → internal depth ──
+    if search_depth:
+        depth_map = {"min": "snippets", "medium": "deep", "max": "thorough"}
+        depth = depth_map.get(search_depth, depth)
+
+    # ── Auto-upgrade: snippets → deep for complex queries ──
+    # The model often picks "snippets" for questions that need real page content.
+    # Upgrade if the query looks like it needs research (policy, analysis, comparison).
+    if depth == "snippets":
+        q_lower = query.lower()
+        _complex_indicators = [
+            # German research keywords
+            "was sieht", "was plant", "wie ändert", "wie verändert",
+            "auswirkungen", "konsequenzen", "reform", "gesetz", "verordnung",
+            "vergleich", "unterschied", "analyse", "studie", "prognose",
+            "vor- und nachteile", "stabilisieren", "strategie", "konzept",
+            # German event/local queries (need page content, not just snippets)
+            "veranstaltung", "event", "programm", "was gibt es",
+            "was ist los", "was kann man", "interessant für",
+            # English research keywords
+            "what are the", "how does", "compare", "impact", "consequences",
+            "analysis", "policy", "reform", "regulation", "strategy",
+            "what events", "things to do", "interesting for tourists",
+            # Question complexity: >8 words or contains analytical keywords
+        ]
+        _is_complex = (
+            any(ind in q_lower for ind in _complex_indicators)
+            or len(query.split()) > 10
+        )
+        if _is_complex:
+            depth = "deep"
+            log.info(f"web_search: auto-upgrade snippets→deep for complex query: "
+                     f"'{query[:60]}'")
+
+    # ── Resolve max_pages from config + depth ──
+    DEPTH_DEFAULTS = {
+        "snippets": ws_cfg.min_pages,   # Even snippets get min_pages
+        "deep": ws_cfg.max_pages_deep,
+        "thorough": ws_cfg.max_pages_thorough,
+    }
+    if max_pages is None:
+        max_pages = DEPTH_DEFAULTS.get(depth, ws_cfg.min_pages)
+    max_pages = max(ws_cfg.min_pages, min(ws_cfg.max_pages_thorough, max_pages))
+
+    # Convert "none" string to actual None for search APIs
     effective_tf = None if time_filter == "none" else time_filter
     # For research: don't append current date to search query
     append_date = depth == "snippets"
 
-    log.info(f"web_search: depth={depth}, max_pages={max_pages}, "
-             f"tf={effective_tf}, date={append_date}, query='{query[:60]}'")
+    # ── Determine which engines to use ──
+    # min/medium: primary engine only, max: all configured engines
+    if depth == "thorough":
+        engines = ws_cfg.engines
+    else:
+        engines = ws_cfg.engines[:1]  # Just primary
 
-    # Step 1: DDG snippets (always, fast)
+    log.info(f"web_search: depth={depth}, max_pages={max_pages}, "
+             f"engines={engines}, tf={effective_tf}, date={append_date}, "
+             f"multi_q={len(additional_queries or [])}, query='{query[:60]}'")
+
+    # ── Collect all queries ──
+    all_queries = [query]
+    if additional_queries and ws_cfg.multi_query:
+        all_queries.extend(additional_queries[:ws_cfg.max_queries - 1])
+
+    # ── Step 1: Snippet-only mode (only if min_pages=0 explicitly) ──
+    if max_pages == 0:
+        loop = asyncio.get_event_loop()
+        # If multi-query: run all queries and merge snippets
+        if len(all_queries) > 1:
+            tasks = [
+                loop.run_in_executor(None, _ddg_search_sync, q, effective_tf, append_date)
+                for q in all_queries
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            merged_parts = []
+            for r in results:
+                if isinstance(r, str) and not r.startswith("Fehler"):
+                    merged_parts.append(r)
+            snippets = "\n\n".join(merged_parts) if merged_parts else f"Keine Ergebnisse für: {query}"
+        else:
+            snippets = await loop.run_in_executor(
+                None, _ddg_search_sync, query, effective_tf, append_date)
+
+        # Build source footer from snippet URLs
+        if ws_cfg.show_sources and ws_cfg.source_format == "footer":
+            _snippet_footer = _extract_source_footer_from_snippets(snippets)
+            if _snippet_footer:
+                _set_source_footer(_snippet_footer)
+
+        return snippets
+
+    # ── Step 2: Deep/thorough — multi-engine, multi-query ──
+    try:
+        from web_enrichment import (
+            multi_engine_search, fetch_pages, build_context, build_source_footer,
+        )
+
+        # Run all queries across all engines in parallel
+        search_tasks = []
+        for q in all_queries:
+            search_tasks.append(
+                multi_engine_search(
+                    query=q,
+                    engines=engines,
+                    max_results=ws_cfg.max_snippets,
+                    time_filter=effective_tf,
+                    append_date=append_date,
+                )
+            )
+
+        all_results_per_query = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+        # Merge + deduplicate across all queries
+        seen_urls = set()
+        merged_results = []
+        for qr in all_results_per_query:
+            if isinstance(qr, Exception):
+                log.warning(f"Search query failed: {qr}")
+                continue
+            for r in qr:
+                url_key = r.url.rstrip("/").lower()
+                if url_key not in seen_urls:
+                    seen_urls.add(url_key)
+                    merged_results.append(r)
+
+        if not merged_results:
+            return f"Keine Ergebnisse für: {query}"
+
+        log.info(f"Multi-query search: {len(all_queries)} queries × "
+                 f"{len(engines)} engines → {len(merged_results)} unique results")
+
+        # Fetch full-text from top results
+        fetched = await fetch_pages(merged_results, max_pages=max_pages)
+
+        if fetched > 0:
+            # Detect language from query
+            _lang = "de" if any(c in query.lower() for c in
+                               ["ä","ö","ü","ß","und","der","die","das"]) else "en"
+            # Use build_context for consistent analytical framing
+            deep_context = build_context(
+                query, merged_results, mode="synthesis",
+                language=_lang, depth=depth,
+            )
+
+            # Build source footer if enabled
+            source_footer = ""
+            if ws_cfg.show_sources and ws_cfg.source_format == "footer":
+                source_footer = build_source_footer(merged_results, language=_lang, depth=depth)
+
+            log.info(f"Deep web search: {fetched} pages, depth={depth}, "
+                     f"~{len(deep_context)//4} tok, "
+                     f"sources={'yes' if source_footer else 'no'}")
+
+            # Store source footer for later appending to LLM response
+            _set_source_footer(source_footer)
+
+            return deep_context
+
+    except Exception as e:
+        log.warning(f"Deep web search failed ({depth}): {e}")
+
+    # Fallback: DDG snippets
     loop = asyncio.get_event_loop()
-    snippets = await loop.run_in_executor(
+    return await loop.run_in_executor(
         None, _ddg_search_sync, query, effective_tf, append_date)
 
-    # Step 2: Full-text extraction if depth > snippets
-    if max_pages > 0:
+
+# Module-level storage for source footer (set by web_search, read by main.py)
+# Using a plain dict instead of contextvars because contextvars don't propagate
+# back from asyncio.gather() tasks to the caller.
+# This is safe because asyncio runs single-threaded.
+_source_footer_store: dict[str, str] = {"footer": ""}
+
+def get_last_source_footer() -> str:
+    """Get the source footer from the most recent web search."""
+    return _source_footer_store.get("footer", "")
+
+def clear_source_footer():
+    """Clear the stored source footer."""
+    _source_footer_store["footer"] = ""
+
+def _set_source_footer(footer: str):
+    """Store source footer for later retrieval by main.py."""
+    _source_footer_store["footer"] = footer
+
+
+def _extract_source_footer_from_snippets(snippet_text: str) -> str:
+    """Extract URLs from DDG snippet text and build a source footer.
+
+    Snippet text contains lines like:
+        → https://example.com/article
+    Parse these into a numbered source list.
+    Filters out obviously irrelevant domains.
+    """
+    import re
+    from urllib.parse import urlparse
+
+    _IRRELEVANT_TLDS = {".ru", ".pro", ".ua"}
+    _IRRELEVANT_DOMAINS = {
+        "hltv.org", "mail.ru", "tv.mail.ru", "kinodraiv.pro",
+        "o-politico.ru", "pndexam.ru",
+    }
+
+    urls = re.findall(r'→\s*(https?://\S+)', snippet_text)
+    if not urls:
+        return ""
+
+    seen = set()
+    lines = ["\n---", "Quellen:"]
+    idx = 1
+    for url in urls:
+        url_key = url.rstrip("/").lower()
+        if url_key in seen:
+            continue
+
+        # Filter irrelevant domains
         try:
-            from web_enrichment import ddg_search, fetch_pages, build_context
-            ddg_max = 5 if depth == "thorough" else 3
+            domain = urlparse(url).hostname or ""
+            tld = "." + domain.rsplit(".", 1)[-1] if "." in domain else ""
+            if tld in _IRRELEVANT_TLDS or domain in _IRRELEVANT_DOMAINS:
+                continue
+        except Exception:
+            pass
 
-            results = await ddg_search(
-                query, max_results=ddg_max,
-                time_filter=effective_tf,
-                append_date=append_date,
-            )
-            if results:
-                fetched = await fetch_pages(results, max_pages=max_pages)
-                if fetched > 0:
-                    # Detect language from query
-                    _lang = "de" if any(c in query.lower() for c in
-                                       ["ä","ö","ü","ß","und","der","die","das"]) else "en"
-                    # Use build_context for consistent analytical framing
-                    deep_context = build_context(
-                        query, results, mode="synthesis",
-                        language=_lang, depth=depth,
-                    )
-                    log.info(f"Deep web search: {fetched} pages, depth={depth}, "
-                             f"~{len(deep_context)//4} tok")
-                    return deep_context
-        except Exception as e:
-            log.warning(f"Deep web search failed ({depth}): {e}")
+        seen.add(url_key)
+        lines.append(f"[{idx}] {url}")
+        idx += 1
 
-    return snippets
+    return "\n".join(lines) if idx > 1 else ""
 
 
 def _ddg_search_sync(query, time_filter, append_date=True):
@@ -1194,8 +1743,10 @@ async def execute_tool_calls(tool_calls: list[dict]) -> list[dict]:
             tasks.append(handler(
                 args.get("query", ""),
                 args.get("time_filter", "w"),
-                args.get("depth", "snippets"),
-                args.get("max_pages"),  # None = auto from depth
+                args.get("depth", "snippets"),           # Legacy compat
+                args.get("max_pages"),                    # None = auto from depth
+                args.get("additional_queries"),            # Multi-query
+                args.get("search_depth"),                  # min/medium/max
             ))
         meta.append((tc_id, func_name))
 

@@ -58,3 +58,7 @@ trafilatura>=1.12.0       # Web page text extraction (best quality, used by web_
 # faster-whisper>=1.0.0   # Local Whisper: pip install faster-whisper --break-system-packages
 # Note: Groq Whisper API (free tier) is used first if GROQ_API_KEY is set
 # Note: faster-whisper downloads ~140MB model on first use (base), runs on CPU
+
+# JS rendering for web search (optional — improves event/calendar site extraction)
+# playwright>=1.40.0      # pip install playwright --break-system-packages && playwright install chromium
+# Note: Chromium download is ~400MB. Only needed for JS-heavy event calendar sites.

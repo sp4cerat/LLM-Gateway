@@ -293,3 +293,32 @@ class GatewayConfig(BaseModel):
     security: SecurityConfig = SecurityConfig()
     routing_strategy: str = "cost_optimized"
     mock_mode: bool = False
+    web_search: "WebSearchConfig" = None  # type: ignore
+
+    def model_post_init(self, __context):
+        if self.web_search is None:
+            self.web_search = WebSearchConfig()
+
+
+class WebSearchConfig(BaseModel):
+    """Web search pipeline configuration."""
+    # Result counts
+    max_snippets: int = 5            # DDG snippet results to fetch
+    min_pages: int = 2               # MINIMUM pages to always download (even for 'min' depth)
+    max_pages_deep: int = 5          # Full-text pages for 'deep' depth
+    max_pages_thorough: int = 8      # Full-text pages for 'thorough' depth
+
+    # Content extraction
+    max_page_chars: int = 12000      # Max chars extracted per page (~3000 tokens)
+    page_fetch_timeout: float = 8.0  # Timeout per page fetch in seconds
+
+    # Source citations
+    show_sources: bool = True        # Append source URLs to LLM response
+    source_format: str = "footer"    # "footer" = [1] URL at end, "none" = disabled
+
+    # Search engines (order = priority)
+    engines: list[str] = ["ddg"]     # Available: "ddg", "google", "bing"
+
+    # Multi-query
+    multi_query: bool = True         # Allow model to issue multiple search queries
+    max_queries: int = 3             # Max parallel queries per search call
