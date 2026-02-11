@@ -118,7 +118,7 @@ Client (any OpenAI-compatible client or SDK)
 
 ```bash
 git clone https://github.com/sp4cerat/LLM-Gateway.git
-cd LLM-Gateway
+cd LLM-Gateway/files
 bash setup.sh
 ```
 
