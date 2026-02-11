@@ -1,1 +1,1048 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Gateway — Test Console</title>
+<style>
+:root {
+  --bg: #0f1117; --surface: #1a1d27; --surface2: #242836;
+  --border: #2d3148; --text: #e4e6f0; --text2: #8b8fa8;
+  --accent: #6c72cb; --accent2: #4a7dff; --green: #3dd68c;
+  --orange: #f0a050; --red: #f06060; --yellow: #e8d44d;
+  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+}
 
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg); color: var(--text);
+  height: 100vh; height: 100dvh; display: flex; flex-direction: column;
+  overflow: hidden;
+}
+
+/* ─── Header ────────────────────────────────────────────── */
+header {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 12px 20px; display: flex; align-items: center; gap: 16px;
+  flex-shrink: 0;
+}
+header h1 { font-size: 16px; font-weight: 600; }
+header h1 span { color: var(--accent); }
+.status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--red); flex-shrink: 0;
+}
+.status-dot.ok { background: var(--green); }
+#health-info { font-size: 12px; color: var(--text2); font-family: var(--mono); }
+
+.key-section {
+  margin-left: auto; display: flex; align-items: center; gap: 8px;
+}
+.key-section input {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 10px; border-radius: 6px; font-size: 12px; width: 260px;
+  font-family: var(--mono);
+}
+.key-section button {
+  background: var(--accent); color: #fff; border: none; padding: 6px 14px;
+  border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 500;
+}
+.key-section button:hover { opacity: 0.85; }
+
+/* ─── Chat Area ─────────────────────────────────────────── */
+#chat {
+  flex: 1; overflow-y: auto; padding: 20px;
+  display: flex; flex-direction: column; gap: 16px;
+  min-height: 0; /* Critical: prevents flex child from overflowing */
+}
+
+.msg {
+  max-width: 85%; display: flex; flex-direction: column; gap: 6px;
+}
+.msg.user { align-self: flex-end; }
+.msg.assistant { align-self: flex-start; }
+
+.msg-bubble {
+  padding: 12px 16px; border-radius: 14px; font-size: 14px;
+  line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+}
+.msg.user .msg-bubble {
+  background: var(--accent2); color: #fff; border-bottom-right-radius: 4px;
+}
+.msg.assistant .msg-bubble {
+  background: var(--surface2); border-bottom-left-radius: 4px;
+}
+
+.msg-image {
+  max-width: 300px; max-height: 200px; border-radius: 10px;
+  object-fit: cover; cursor: pointer;
+}
+.msg-image:hover { opacity: 0.9; }
+
+/* ─── Metadata Panel ────────────────────────────────────── */
+.msg-meta {
+  display: flex; flex-wrap: wrap; gap: 6px; padding: 0 4px;
+}
+.tag {
+  font-size: 10px; font-family: var(--mono); padding: 2px 8px;
+  border-radius: 10px; background: var(--surface); border: 1px solid var(--border);
+  color: var(--text2); white-space: nowrap;
+}
+.tag.tier { color: var(--green); border-color: rgba(61,214,140,0.3); }
+.tag.cost { color: var(--orange); border-color: rgba(240,160,80,0.3); }
+.tag.vision { color: var(--yellow); border-color: rgba(232,212,77,0.3); }
+.tag.tools { color: var(--accent); border-color: rgba(108,114,203,0.3); }
+.tag.tokens { color: var(--text2); }
+.tag.error { color: var(--red); border-color: rgba(240,96,96,0.3); background: rgba(240,96,96,0.08); }
+
+/* ─── Input Area ────────────────────────────────────────── */
+#input-area {
+  background: var(--surface); border-top: 1px solid var(--border);
+  padding: 14px 20px; flex-shrink: 0; z-index: 10;
+  position: relative;
+}
+#preview-strip {
+  display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap;
+}
+#preview-strip:empty { display: none; margin: 0; }
+.preview-item {
+  position: relative; width: 60px; height: 60px;
+  border-radius: 8px; overflow: hidden; border: 1px solid var(--border);
+}
+.preview-item img { width: 100%; height: 100%; object-fit: cover; }
+.preview-remove {
+  position: absolute; top: -4px; right: -4px; width: 18px; height: 18px;
+  background: var(--red); border: none; border-radius: 50%; color: #fff;
+  font-size: 10px; cursor: pointer; display: flex; align-items: center;
+  justify-content: center; line-height: 1;
+}
+
+.input-row { display: flex; gap: 10px; align-items: flex-end; }
+
+#msg-input {
+  flex: 1; background: var(--bg); border: 1px solid var(--border);
+  color: var(--text); padding: 12px 16px; border-radius: 12px;
+  font-size: 14px; font-family: inherit; resize: none;
+  min-height: 44px; max-height: 160px; line-height: 1.4;
+}
+#msg-input::placeholder { color: var(--text2); }
+#msg-input:focus { outline: none; border-color: var(--accent); }
+
+.input-actions { display: flex; gap: 6px; }
+.icon-btn {
+  width: 42px; height: 42px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text2); cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; transition: all 0.15s;
+}
+.icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+#send-btn {
+  background: var(--accent2); border-color: var(--accent2); color: #fff;
+}
+#send-btn:hover { opacity: 0.85; }
+#send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+#mic-btn.recording {
+  background: #e53e3e; border-color: #e53e3e; color: #fff;
+  animation: pulse-rec 1s infinite;
+}
+@keyframes pulse-rec {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+#recording-timer {
+  font-size: 12px; color: #e53e3e; font-family: var(--mono);
+  padding: 2px 8px; display: none; align-self: center;
+}
+
+.drop-overlay {
+  position: fixed; inset: 0; background: rgba(108,114,203,0.15);
+  border: 3px dashed var(--accent); z-index: 100;
+  display: none; align-items: center; justify-content: center;
+  font-size: 24px; font-weight: 600; color: var(--accent);
+}
+.drop-overlay.active { display: flex; }
+
+/* ─── Typing Indicator ──────────────────────────────────── */
+.typing { display: flex; gap: 4px; padding: 12px 16px; }
+.typing span {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--text2);
+  animation: blink 1.4s infinite both;
+}
+.typing span:nth-child(2) { animation-delay: 0.2s; }
+.typing span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes blink { 0%,80%,100% { opacity: 0.3; } 40% { opacity: 1; } }
+
+/* ─── Responsive ────────────────────────────────────────── */
+@media (max-width: 640px) {
+  .key-section input { width: 120px; }
+  .msg { max-width: 95%; }
+  header { padding: 10px 12px; gap: 8px; flex-wrap: wrap; }
+  #chat { padding: 10px; gap: 12px; }
+  #input-area { padding: 10px 12px; }
+  .icon-btn { width: 38px; height: 38px; font-size: 16px; }
+  #msg-input { padding: 10px 14px; font-size: 14px; min-height: 40px; }
+  .msg-bubble { padding: 10px 14px; font-size: 13px; }
+  #health-info { display: none; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="status-dot" id="status-dot"></div>
+  <h1>LLM Gateway <span>Test Console</span></h1>
+  <span id="health-info">connecting...</span>
+  <div class="key-section">
+    <button onclick="newChat()" style="background:var(--surface2);color:var(--text2)">New Chat</button>
+    <input type="password" id="api-key" placeholder="GATEWAY_SECRET" autocomplete="off">
+    <button onclick="saveKey()">Save</button>
+  </div>
+</header>
+
+<div id="chat"></div>
+
+<div class="drop-overlay" id="drop-overlay">Drop files here (images, audio, PDF, code, DOCX, ZIP)</div>
+
+<div id="input-area">
+  <div id="preview-strip"></div>
+  <div class="input-row">
+    <textarea id="msg-input" rows="1" placeholder="Message... (drop/paste files: images, audio, PDF, DOCX, code)"
+              onkeydown="handleKey(event)"></textarea>
+    <div class="input-actions">
+      <button class="icon-btn" title="Upload file" onclick="document.getElementById('file-input').click()">📎</button>
+      <input type="file" id="file-input" accept="image/*,audio/*,.m4a,.mp3,.wav,.ogg,.webm,.flac,.aac,.wma,.pdf,.docx,.doc,.xlsx,.xls,.csv,.txt,.md,.py,.js,.ts,.jsx,.tsx,.html,.css,.json,.xml,.yaml,.yml,.sh,.bash,.c,.cpp,.h,.java,.go,.rs,.rb,.php,.sql,.r,.swift,.kt,.zip,.tar,.gz,.log,.env,.toml,.ini,.cfg" multiple
+             style="display:none" onchange="handleFiles(this.files)">
+      <button class="icon-btn" id="mic-btn" onclick="toggleRecording()" title="Voice input (click to record, click again to stop)">🎤</button>
+      <span id="recording-timer">0:00</span>
+      <span id="stt-method" style="font-size:10px;color:var(--text2);align-self:center;cursor:pointer;user-select:none" onclick="toggleSTTMethod()" title="Click to switch STT method"></span>
+      <button class="icon-btn" id="send-btn" onclick="send()" title="Send">▶</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── State ──────────────────────────────────────────────────
+const API_BASE = window.location.origin;
+let conversation = [];
+let pendingFiles = [];  // [{type, name, b64?, text?, mime?, preview?, lang?}]
+let sending = false;
+
+// ─── File Type Sets (must be before any function that uses them) ────
+const TEXT_EXTENSIONS = new Set([
+  'txt','md','py','js','ts','jsx','tsx','html','css','json','xml',
+  'yaml','yml','sh','bash','c','cpp','h','java','go','rs','rb',
+  'php','sql','r','swift','kt','log','env','toml','ini','cfg',
+  'csv','tsv','conf','makefile','dockerfile','gitignore',
+]);
+
+const AUDIO_EXTENSIONS = new Set([
+  'm4a','mp3','wav','ogg','webm','flac','aac','wma','opus','aiff',
+]);
+
+// ─── API Key Management ─────────────────────────────────────
+function getKey() {
+  return document.getElementById('api-key').value || localStorage.getItem('gw_key') || '';
+}
+function saveKey() {
+  const k = document.getElementById('api-key').value.trim();
+  if (k) {
+    localStorage.setItem('gw_key', k);
+    checkHealth();
+    document.getElementById('api-key').value = k;
+    document.getElementById('api-key').type = 'password';
+  }
+}
+// Load saved key
+const saved = localStorage.getItem('gw_key');
+if (saved) document.getElementById('api-key').value = saved;
+
+// ─── Health Check ───────────────────────────────────────────
+async function checkHealth() {
+  const dot = document.getElementById('status-dot');
+  const info = document.getElementById('health-info');
+  try {
+    const r = await fetch(`${API_BASE}/health`);
+    const d = await r.json();
+    dot.classList.add('ok');
+    const auth = d.security?.api_key_required ? '🔒' : '🔓';
+    info.textContent = `v${d.version} ${auth} up:${Math.round(d.uptime_seconds)}s`;
+  } catch(e) {
+    dot.classList.remove('ok');
+    info.textContent = 'offline';
+  }
+}
+checkHealth();
+setInterval(checkHealth, 30000);
+updateSTTIndicator();
+// Dim mic button if no HTTPS
+if (!window.isSecureContext) {
+  const micBtn = document.getElementById('mic-btn');
+  if (micBtn) {
+    micBtn.style.opacity = '0.4';
+    micBtn.title = 'Mic requires HTTPS — use 📎 to upload audio files instead';
+  }
+  const sttEl = document.getElementById('stt-method');
+  if (sttEl) sttEl.textContent = '📎';
+}
+
+// ─── Voice Recording (2-tier: Browser Speech API → Groq Whisper) ────
+let mediaRecorder = null;
+let audioChunks = [];
+let recordingStart = 0;
+let recordingTimer = null;
+let speechRecognition = null;
+let speechResult = '';
+let useBrowserSTT = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+
+function getSpeechMethod() {
+  return useBrowserSTT ? 'browser' : 'server';
+}
+
+function updateSTTIndicator() {
+  const el = document.getElementById('stt-method');
+  if (el) el.textContent = useBrowserSTT ? '🌐' : '☁️';
+}
+
+function toggleSTTMethod() {
+  const hasBrowserSTT = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  if (!hasBrowserSTT) {
+    alert('Browser Speech API not available — using Groq Whisper (server)');
+    return;
+  }
+  useBrowserSTT = !useBrowserSTT;
+  updateSTTIndicator();
+  const method = useBrowserSTT ? 'Browser Speech API (free)' : 'Groq Whisper (server)';
+  console.log('STT method:', method);
+}
+
+async function toggleRecording() {
+  const btn = document.getElementById('mic-btn');
+  const timer = document.getElementById('recording-timer');
+
+  // ── Stop recording ──
+  if (btn.classList.contains('recording')) {
+    btn.classList.remove('recording');
+    btn.textContent = '🎤';
+    timer.style.display = 'none';
+    clearInterval(recordingTimer);
+
+    if (speechRecognition) {
+      speechRecognition.stop();
+      speechRecognition = null;
+    }
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+    }
+    return;
+  }
+
+  // ── Check secure context (HTTPS required for mic) ──
+  if (!window.isSecureContext) {
+    alert('🎤 Microphone requires HTTPS.\n\nAlternative: Upload an audio file via 📎 (m4a, mp3, wav etc.) — it will be transcribed automatically.');
+    return;
+  }
+
+  // ── Start recording ──
+  recordingStart = Date.now();
+  btn.classList.add('recording');
+  btn.textContent = '⏹';
+  timer.style.display = 'inline';
+  timer.textContent = '0:00';
+  recordingTimer = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - recordingStart) / 1000);
+    const min = Math.floor(elapsed / 60);
+    const sec = String(elapsed % 60).padStart(2, '0');
+    timer.textContent = `${min}:${sec}`;
+  }, 500);
+
+  if (useBrowserSTT) {
+    // ── Tier 1: Web Speech API (free, instant) ──
+    startBrowserSTT(btn, timer);
+  } else {
+    // ── Tier 2: Groq Whisper (server-side fallback) ──
+    startServerSTT(btn, timer);
+  }
+}
+
+function startBrowserSTT(btn, timer) {
+  const SpeechAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+  speechRecognition = new SpeechAPI();
+  speechRecognition.continuous = true;
+  speechRecognition.interimResults = true;
+  speechRecognition.lang = ''; // auto-detect (browser picks from system language)
+  // Try German first since user is in DE, browser will auto-detect
+  speechRecognition.lang = navigator.language || 'de-DE';
+
+  const input = document.getElementById('msg-input');
+  let finalText = '';
+  let interimText = '';
+
+  speechRecognition.onresult = (event) => {
+    finalText = '';
+    interimText = '';
+    for (let i = 0; i < event.results.length; i++) {
+      const transcript = event.results[i][0].transcript;
+      if (event.results[i].isFinal) {
+        finalText += transcript;
+      } else {
+        interimText += transcript;
+      }
+    }
+    // Show live transcription in input
+    const base = input.dataset.originalValue || '';
+    input.value = (base ? base + ' ' : '') + finalText + (interimText ? '...' + interimText : '');
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+  };
+
+  speechRecognition.onend = () => {
+    // Finalize
+    const base = input.dataset.originalValue || '';
+    if (finalText) {
+      input.value = (base ? base + ' ' : '') + finalText;
+    }
+    delete input.dataset.originalValue;
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+    input.focus();
+    btn.classList.remove('recording');
+    btn.textContent = '🎤';
+    timer.style.display = 'none';
+    clearInterval(recordingTimer);
+    const secs = ((Date.now() - recordingStart) / 1000).toFixed(0);
+    console.log(`Browser STT: "${finalText}" (${secs}s)`);
+  };
+
+  speechRecognition.onerror = (event) => {
+    console.warn('Browser STT error:', event.error);
+    if (event.error === 'not-allowed') {
+      alert('Microphone access denied. Please allow microphone access in your browser settings.');
+    } else if (event.error === 'no-speech') {
+      // Silent — just stop gracefully
+    } else {
+      // Fallback to server STT
+      console.log('Browser STT failed, falling back to Groq Whisper');
+      useBrowserSTT = false;
+      startServerSTT(btn, timer);
+      return;
+    }
+    btn.classList.remove('recording');
+    btn.textContent = '🎤';
+    timer.style.display = 'none';
+    clearInterval(recordingTimer);
+  };
+
+  // Save current input value to restore base
+  input.dataset.originalValue = input.value;
+  speechRecognition.start();
+}
+
+async function startServerSTT(btn, timer) {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioChunks = [];
+
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : 'audio/mp4';
+
+    mediaRecorder = new MediaRecorder(stream, { mimeType });
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) audioChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      if (audioChunks.length === 0) return;
+
+      const blob = new Blob(audioChunks, { type: mimeType });
+      if (blob.size < 100) return;
+
+      const input = document.getElementById('msg-input');
+      const origPlaceholder = input.placeholder;
+      input.placeholder = '⏳ Transcribing...';
+      input.disabled = true;
+
+      try {
+        const b64 = await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result.split(',')[1]);
+          reader.readAsDataURL(blob);
+        });
+
+        const key = getKey();
+        const r = await fetch(`${API_BASE}/v1/audio/transcribe`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${key}`,
+          },
+          body: JSON.stringify({
+            audio_b64: b64,
+            mime_type: mimeType.split(';')[0],
+          }),
+        });
+
+        if (r.ok) {
+          const result = await r.json();
+          if (result.text) {
+            input.value = (input.value ? input.value + ' ' : '') + result.text;
+            input.style.height = 'auto';
+            input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+            input.focus();
+            const secs = ((Date.now() - recordingStart) / 1000).toFixed(0);
+            const method = result.method || 'server';
+            console.log(`${method} STT: "${result.text}" (${secs}s audio, ${result.duration_ms}ms API)`);
+          }
+        } else {
+          const err = await r.json().catch(() => ({ detail: r.statusText }));
+          alert(`Transcription failed: ${err.detail || 'Unknown error'}`);
+        }
+      } catch (e) {
+        alert(`Transcription error: ${e.message}`);
+      } finally {
+        input.disabled = false;
+        input.placeholder = origPlaceholder;
+        input.focus();
+      }
+    };
+
+    mediaRecorder.start(250);
+  } catch (e) {
+    if (e.name === 'NotAllowedError') {
+      alert('Microphone access denied. Please allow microphone access in your browser settings.');
+    } else {
+      alert(`Microphone error: ${e.message}`);
+    }
+    btn.classList.remove('recording');
+    btn.textContent = '🎤';
+    timer.style.display = 'none';
+    clearInterval(recordingTimer);
+  }
+}
+
+// ─── Image Handling ─────────────────────────────────────────
+// ─── File Type Detection ────────────────────────────────────
+
+function getFileCategory(file) {
+  const ext = file.name.split('.').pop()?.toLowerCase() || '';
+  if (file.type.startsWith('image/')) return 'image';
+  if (file.type.startsWith('audio/') || AUDIO_EXTENSIONS.has(ext)) return 'audio';
+  if (file.type === 'application/pdf' || ext === 'pdf') return 'pdf';
+  if (TEXT_EXTENSIONS.has(ext) || file.type.startsWith('text/')) return 'text';
+  // Binary docs that need server-side extraction
+  if (['docx','doc','xlsx','xls','zip','tar','gz'].includes(ext)) return 'binary';
+  // Try as text if small enough
+  if (file.size < 500_000) return 'text';
+  return 'binary';
+}
+
+function getLanguageTag(filename) {
+  const ext = filename.split('.').pop()?.toLowerCase() || '';
+  const map = {
+    py:'python', js:'javascript', ts:'typescript', jsx:'jsx', tsx:'tsx',
+    html:'html', css:'css', json:'json', xml:'xml', yaml:'yaml', yml:'yaml',
+    sh:'bash', c:'c', cpp:'cpp', java:'java', go:'go', rs:'rust',
+    rb:'ruby', php:'php', sql:'sql', r:'r', swift:'swift', kt:'kotlin',
+  };
+  return map[ext] || ext;
+}
+
+function fileToB64(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      const [header, data] = dataUrl.split(',');
+      const mime = header.match(/:(.*?);/)?.[1] || 'application/octet-stream';
+      resolve({ b64: data, mime, preview: dataUrl, name: file.name });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function fileToText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Failed to read file'));
+    reader.readAsText(file);
+  });
+}
+
+// ─── Pending Files (images + text + documents) ─────────────
+// Each item: { type: 'image'|'text'|'binary', name, preview?, b64?, text?, mime? }
+
+async function handleFiles(files) {
+  for (const f of files) {
+    try {
+      if (f.size > 20 * 1024 * 1024) { alert(`${f.name} too large (max 20MB)`); continue; }
+
+      const category = getFileCategory(f);
+
+      if (category === 'image') {
+        const data = await fileToB64(f);
+        pendingFiles.push({
+          type: 'image', name: f.name,
+          b64: data.b64, mime: data.mime, preview: data.preview,
+        });
+
+    } else if (category === 'pdf') {
+      // PDFs → extract text server-side (providers don't support raw PDF)
+      const data = await fileToB64(f);
+      pendingFiles.push({
+        type: 'binary', name: f.name,
+        b64: data.b64, mime: 'application/pdf', preview: null,
+      });
+
+    } else if (category === 'audio') {
+      // Audio files → transcribe via server endpoint
+      const data = await fileToB64(f);
+      pendingFiles.push({
+        type: 'audio', name: f.name,
+        b64: data.b64, mime: data.mime || 'audio/mpeg', preview: null,
+      });
+
+    } else if (category === 'text') {
+      try {
+        const text = await fileToText(f);
+        pendingFiles.push({
+          type: 'text', name: f.name,
+          text: text, lang: getLanguageTag(f.name), preview: null,
+        });
+      } catch(e) {
+        // Fallback: try as binary
+        const data = await fileToB64(f);
+        pendingFiles.push({
+          type: 'binary', name: f.name,
+          b64: data.b64, mime: data.mime, preview: null,
+        });
+      }
+
+    } else {
+      // Binary: upload to server for extraction
+      const data = await fileToB64(f);
+      pendingFiles.push({
+        type: 'binary', name: f.name,
+        b64: data.b64, mime: data.mime, preview: null,
+      });
+    }
+    } catch(err) {
+      console.error(`Failed to process ${f.name}:`, err);
+      alert(`Failed to attach ${f.name}: ${err.message}`);
+    }
+  }
+  // Reset file input so the same file can be attached again
+  const fileInput = document.getElementById('file-input');
+  if (fileInput) fileInput.value = '';
+  renderPreviews();
+}
+
+function renderPreviews() {
+  const strip = document.getElementById('preview-strip');
+  strip.innerHTML = '';
+  pendingFiles.forEach((file, i) => {
+    const div = document.createElement('div');
+    div.className = 'preview-item';
+    if (file.type === 'image') {
+      div.innerHTML = `
+        <img src="${file.preview}" alt="${file.name}">
+        <button class="preview-remove" onclick="removeFile(${i})">×</button>
+      `;
+    } else {
+      // File icon preview
+      const icon = file.name.endsWith('.pdf') ? '📄' :
+                   file.type === 'audio' ? '🎵' :
+                   file.type === 'text' ? '📝' : '📦';
+      const ext = file.name.split('.').pop()?.toUpperCase() || '?';
+      div.innerHTML = `
+        <div style="width:100%;height:100%;display:flex;flex-direction:column;
+                    align-items:center;justify-content:center;background:var(--bg);
+                    font-size:10px;color:var(--text2);padding:2px;">
+          <span style="font-size:18px">${icon}</span>
+          <span style="max-width:56px;overflow:hidden;text-overflow:ellipsis;
+                       white-space:nowrap">.${ext}</span>
+        </div>
+        <button class="preview-remove" onclick="removeFile(${i})">×</button>
+      `;
+    }
+    strip.appendChild(div);
+  });
+}
+
+function removeFile(i) {
+  pendingFiles.splice(i, 1);
+  renderPreviews();
+}
+
+// Drag & Drop
+const overlay = document.getElementById('drop-overlay');
+let dragCounter = 0;
+document.addEventListener('dragenter', (e) => { e.preventDefault(); dragCounter++; overlay.classList.add('active'); });
+document.addEventListener('dragleave', (e) => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { overlay.classList.remove('active'); dragCounter = 0; } });
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', async (e) => {
+  e.preventDefault(); overlay.classList.remove('active'); dragCounter = 0;
+  if (e.dataTransfer.files.length) await handleFiles(e.dataTransfer.files);
+});
+
+// Paste images
+document.addEventListener('paste', async (e) => {
+  const items = [...(e.clipboardData?.items || [])];
+  const imageItems = items.filter(i => i.type.startsWith('image/'));
+  if (imageItems.length) {
+    e.preventDefault();
+    const files = imageItems.map(i => i.getAsFile()).filter(Boolean);
+    await handleFiles(files);
+  }
+});
+
+// ─── Chat ───────────────────────────────────────────────────
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+}
+
+// Auto-resize textarea
+const textarea = document.getElementById('msg-input');
+textarea.addEventListener('input', () => {
+  textarea.style.height = 'auto';
+  textarea.style.height = Math.min(textarea.scrollHeight, 160) + 'px';
+});
+
+function addMessage(role, content, meta = null, images = []) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+
+  let html = '';
+
+  // Show images
+  images.forEach(img => {
+    html += `<img class="msg-image" src="${img.preview}" onclick="window.open(this.src)">`;
+  });
+
+  // Message bubble
+  html += `<div class="msg-bubble">${escapeHtml(content)}</div>`;
+
+  // Metadata tags
+  if (meta) {
+    html += '<div class="msg-meta">';
+    if (meta.tier) html += `<span class="tag tier">⚡ ${meta.tier}/${meta.model?.split('/').pop() || '?'}</span>`;
+    if (meta.cost_usd != null) html += `<span class="tag cost">💰 $${meta.cost_usd.toFixed(6)}</span>`;
+    if (meta.latency_ms) html += `<span class="tag tokens">⏱ ${Math.round(meta.latency_ms)}ms</span>`;
+
+    const u = meta.usage;
+    if (u) html += `<span class="tag tokens">📊 ${u.prompt_tokens}+${u.completion_tokens} tok</span>`;
+
+    // Vision info
+    if (meta.vision_strategy) {
+      const skip = meta.vision_image_skipped ? ' ✂️' : '';
+      html += `<span class="tag vision">👁 ${meta.vision_strategy}${skip}</span>`;
+    }
+    if (meta.multimodal && meta.media_types) {
+      html += `<span class="tag vision">📎 ${meta.media_types.join(',')}</span>`;
+    }
+
+    // Tools
+    const tools = meta.tool_calls_executed;
+    if (tools?.length) html += `<span class="tag tools">🔧 ${tools.join(', ')}</span>`;
+
+    // Cascade
+    if (meta.cascade_escalated) html += `<span class="tag tier">⬆ cascade→${meta.cascade_escalated}</span>`;
+    if (meta.size_escalated) html += `<span class="tag tier">📏 size-escalated</span>`;
+
+    html += '</div>';
+  }
+
+  div.innerHTML = html;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+function addTyping() {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.id = 'typing-indicator';
+  div.innerHTML = '<div class="msg-bubble"><div class="typing"><span></span><span></span><span></span></div></div>';
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+function removeTyping() {
+  document.getElementById('typing-indicator')?.remove();
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function scrollToBottom() {
+  const chat = document.getElementById('chat');
+  // Use rAF to ensure DOM has updated before scrolling
+  requestAnimationFrame(() => {
+    chat.scrollTop = chat.scrollHeight;
+  });
+}
+
+async function send() {
+  if (sending) return;
+  const input = document.getElementById('msg-input');
+  const text = input.value.trim();
+  if (!text && !pendingFiles.length) return;
+
+  const key = getKey();
+  if (!key) { alert('Enter your GATEWAY_SECRET first'); return; }
+
+  // Build content based on attached files
+  let content;
+  const files = [...pendingFiles];
+  const hasFiles = files.length > 0;
+
+  if (hasFiles) {
+    content = [];
+
+    // First: Binary files → extract text via server endpoint
+    const binaries = files.filter(f => f.type === 'binary');
+    if (binaries.length) {
+      for (const bf of binaries) {
+        // Show extraction status
+        const statusDiv = document.createElement('div');
+        statusDiv.className = 'msg assistant';
+        statusDiv.innerHTML = `<div class="msg-body" style="opacity:0.6">⏳ Extracting ${bf.name}...</div>`;
+        document.getElementById('chat').appendChild(statusDiv);
+        scrollToBottom();
+
+        try {
+          const r = await fetch(`${API_BASE}/v1/files/extract`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+            body: JSON.stringify({ filename: bf.name, data_b64: bf.b64 }),
+          });
+          if (r.ok) {
+            const result = await r.json();
+            if (result.text && result.text.trim().length > 10) {
+              bf.type = 'text';
+              bf.text = result.text;
+              bf.lang = result.type || '';
+              statusDiv.innerHTML = `<div class="msg-body" style="opacity:0.6">✅ ${bf.name}: ${result.chars || result.text.length} chars` +
+                `${result.pages ? ', ' + result.pages + ' pages' : ''}` +
+                `${result.method ? ' (' + result.method + ')' : ''}</div>`;
+            } else {
+              statusDiv.innerHTML = `<div class="msg-body" style="opacity:0.6">⚠️ ${bf.name}: empty or unreadable</div>`;
+            }
+          } else {
+            const err = await r.json().catch(() => ({ detail: r.statusText }));
+            statusDiv.innerHTML = `<div class="msg-body" style="color:#f66">❌ ${bf.name}: ${err.detail || 'Extraction failed'}</div>`;
+            console.error('Extraction failed:', err);
+          }
+        } catch(e) {
+          statusDiv.innerHTML = `<div class="msg-body" style="color:#f66">❌ ${bf.name}: ${e.message}</div>`;
+          console.error('Extraction error:', e);
+        }
+      }
+    }
+
+    // Audio files → transcribe via server endpoint
+    const audioFiles = files.filter(f => f.type === 'audio');
+    if (audioFiles.length) {
+      for (const af of audioFiles) {
+        const statusDiv = document.createElement('div');
+        statusDiv.className = 'msg assistant';
+        statusDiv.innerHTML = `<div class="msg-body" style="opacity:0.6">⏳ Transcribing ${af.name}...</div>`;
+        document.getElementById('chat').appendChild(statusDiv);
+        scrollToBottom();
+
+        try {
+          const key = getKey();
+          const r = await fetch(`${API_BASE}/v1/audio/transcribe`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${key}`,
+            },
+            body: JSON.stringify({
+              audio_b64: af.b64,
+              mime_type: af.mime.split(';')[0],
+            }),
+          });
+          if (r.ok) {
+            const result = await r.json();
+            if (result.text && result.text.trim().length > 0) {
+              af.type = 'text';
+              af.text = result.text;
+              const method = result.method || 'server';
+              statusDiv.innerHTML = `<div class="msg-body" style="opacity:0.6">✅ ${af.name}: "${result.text.substring(0, 80)}${result.text.length > 80 ? '...' : ''}" (${method}, ${result.duration_ms}ms)</div>`;
+            } else {
+              statusDiv.innerHTML = `<div class="msg-body" style="opacity:0.6">⚠️ ${af.name}: no speech detected</div>`;
+            }
+          } else {
+            const err = await r.json().catch(() => ({ detail: r.statusText }));
+            statusDiv.innerHTML = `<div class="msg-body" style="color:#f66">❌ ${af.name}: ${err.detail || 'Transcription failed'}</div>`;
+          }
+        } catch(e) {
+          statusDiv.innerHTML = `<div class="msg-body" style="color:#f66">❌ ${af.name}: ${e.message}</div>`;
+        }
+      }
+    }
+
+    // Text/code files → inline as plain text
+    const textFiles = files.filter(f => f.type === 'text');
+    const extractedTexts = textFiles.map(tf => tf.text);
+
+    // Images → base64 image_url blocks
+    const images = files.filter(f => f.type === 'image');
+    images.forEach(img => {
+      content.push({
+        type: 'image_url',
+        image_url: { url: `data:${img.mime};base64,${img.b64}` }
+      });
+    });
+
+    // Build final text: question FIRST, then content as context
+    // This prevents models from thinking they need to "access" a file
+    if (extractedTexts.length && text) {
+      content.push({ type: 'text', text: `${text}\n\n${extractedTexts.join('\n\n')}` });
+    } else if (extractedTexts.length) {
+      content.push({ type: 'text', text: extractedTexts.join('\n\n') });
+    } else if (text) {
+      content.push({ type: 'text', text: text });
+    }
+
+  } else {
+    content = text;
+  }
+
+  // Flatten to string if content is text-only (no images/media)
+  // Many providers (OpenRouter/Gemini) don't support content arrays without media
+  if (Array.isArray(content)) {
+    const hasMedia = content.some(b => ['image_url','image','document'].includes(b.type));
+    if (!hasMedia) {
+      content = content
+        .filter(b => b.type === 'text' && b.text)
+        .map(b => b.text)
+        .join('\n\n');
+    }
+  }
+
+  // Build display label
+  const displayLabel = [];
+  if (text) displayLabel.push(text);
+  if (files.length) {
+    const names = files.map(f => f.name).join(', ');
+    displayLabel.push(`📎 ${names}`);
+  }
+
+  // Add to conversation
+  conversation.push({ role: 'user', content });
+
+  // Show user message (with image previews if any)
+  const imageFiles = files.filter(f => f.type === 'image');
+  addMessage('user', displayLabel.join('\n'), null, imageFiles);
+  input.value = '';
+  input.style.height = 'auto';
+  pendingFiles = [];
+  renderPreviews();
+
+  // Send request
+  sending = true;
+  document.getElementById('send-btn').disabled = true;
+  addTyping();
+
+  try {
+    // Strip heavy content from OLD messages (save bandwidth)
+    const messages = conversation.map((msg, i) => {
+      if (i < conversation.length - 1 && msg.role === 'user' && Array.isArray(msg.content)) {
+        const textParts = msg.content
+          .filter(b => b.type === 'text')
+          .map(b => b.text)
+          .join('\n');
+        const mediaCount = msg.content.filter(b =>
+          ['image_url','image','document'].includes(b.type)).length;
+        return {
+          role: 'user',
+          content: textParts + (mediaCount ? `\n[${mediaCount} file(s) from earlier]` : '')
+        };
+      }
+      return msg;
+    });
+
+    const r = await fetch(`${API_BASE}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: 'auto',
+        messages,
+        max_tokens: 4096,
+        temperature: 0.7,
+      }),
+    });
+
+    removeTyping();
+
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: r.statusText }));
+      addMessage('assistant', `Error ${r.status}: ${err.detail || JSON.stringify(err)}`,
+                 { error: true });
+      conversation.pop();
+      return;
+    }
+
+    const data = await r.json();
+    const msg = data.choices?.[0]?.message;
+    const meta = data.gateway_metadata || {};
+    meta.model = meta.model || data.model;
+    meta.usage = meta.usage || data.usage;
+
+    if (msg?.content) {
+      conversation.push({ role: 'assistant', content: msg.content });
+      addMessage('assistant', msg.content, meta);
+    }
+
+  } catch(e) {
+    removeTyping();
+    addMessage('assistant', `Network error: ${e.message}`, { error: true });
+    conversation.pop();
+  } finally {
+    sending = false;
+    document.getElementById('send-btn').disabled = false;
+    document.getElementById('msg-input').focus();
+  }
+}
+
+// ─── Focus input on load ────────────────────────────────────
+document.getElementById('msg-input').focus();
+
+// ─── Mobile: keep input visible when keyboard opens ─────────
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', () => {
+    document.body.style.height = window.visualViewport.height + 'px';
+    scrollToBottom();
+  });
+}
+// Scroll to input when focused on mobile
+document.getElementById('msg-input').addEventListener('focus', () => {
+  setTimeout(scrollToBottom, 300);
+});
+
+function newChat() {
+  conversation = [];
+  pendingFiles = [];
+  renderPreviews();
+  document.getElementById('chat').innerHTML = '';
+  document.getElementById('msg-input').value = '';
+  document.getElementById('msg-input').focus();
+}
+</script>
+</body>
+</html>
