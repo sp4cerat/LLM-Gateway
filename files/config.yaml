@@ -1,0 +1,82 @@
+# LLM Gateway Configuration v1.5
+# Cost-Optimized AI Routing with Tool Calling, News, i18n
+# Edit this file or run: bash setup.sh
+#
+# NEW in v1.5: Tool Calling, Parallel News, 9-Language i18n
+# Real-time queries (weather/stocks/news) first try FREE Python APIs:
+#   - Open-Meteo (weather, no key needed)
+#   - yfinance (stocks, no key needed)
+#   - NewsAPI.org (news, free tier: 100 req/day, set NEWSAPI_KEY in .env)
+# Only escalates to Gemini 3 Flash (web search) when free APIs fail.
+
+host: "0.0.0.0"
+port: 8000
+debug: false
+mock_mode: false  # Set to false after adding real API keys
+
+# ─── Routing Strategy ────────────────────────────────────────────────────────
+# "cascade"        — Cheap model answers simple stuff directly, escalates
+#                    to medium or premium as needed. (recommended)
+# "cost_optimized" — Separate router classifies first, then dispatches.
+# "quality_first"  — Always use premium model.
+routing_strategy: "cascade"
+
+# ─── Providers ───────────────────────────────────────────────────────────────
+# OpenRouter-only example (single API key):
+providers:
+  router_provider: "openrouter"
+  router_model: "google/gemini-2.0-flash-001"
+  cheap_provider: "openrouter"
+  cheap_model: "google/gemini-2.0-flash-001"               # ~$0.10/M — fast, real-time data, greetings/lookups
+  cheap_plus_provider: "openrouter"
+  cheap_plus_model: "google/gemini-3-flash-preview"        # ~$0.10/$0.40/M + $0.02/search — real-time data (weather, stocks, news)
+  medium_provider: "openrouter"
+  medium_model: "google/gemini-3-flash-preview"             # ~$0.10/$0.40/M — explanations, moderate code
+  premium_provider: "openrouter"
+  premium_model: "google/gemini-2.5-pro"                    # ~$1.25/$10/M — complex reasoning, architecture, translation
+  embedding_provider: "openrouter"
+  embedding_model: "openai/text-embedding-3-small"
+
+# Alternative cheap models with real-time data (via OpenRouter):
+# cheap_model: "x-ai/grok-2-1212"                          # ~$2/$10/M — real-time via X/Twitter
+# cheap_model: "google/gemini-2.0-flash-001"               # ~$0.10/$0.40/M — fast, grounded/real-time
+
+# Multi-provider example (separate API keys):
+# providers:
+#   router_provider: "groq"
+#   router_model: "llama-3.1-8b-instant"
+#   cheap_provider: "groq"
+#   cheap_model: "llama-3.1-8b-instant"
+#   medium_provider: "anthropic"
+#   medium_model: "claude-3-5-haiku-20241022"
+#   premium_provider: "anthropic"
+#   premium_model: "claude-sonnet-4-20250514"
+#   embedding_provider: "openai"
+#   embedding_model: "text-embedding-3-small"
+
+cache:
+  exact_cache_enabled: true
+  semantic_cache_enabled: false  # Enable after adding embedding provider
+  semantic_similarity_threshold: 0.92
+  embedding_cache_ttl_days: 30
+  max_cache_size_mb: 500
+
+budget:
+  daily_soft_limit: 5.0
+  daily_medium_limit: 15.0
+  daily_hard_limit: 50.0
+
+rate_limits:
+  local_rpm: 100
+  local_tpm: 500000
+  cheap_rpm: 60
+  cheap_tpm: 1000000
+  medium_rpm: 40
+  medium_tpm: 800000
+  premium_rpm: 20
+  premium_tpm: 50000
+
+security:
+  require_api_key: true    # REQUIRED for public VPS!
+  enable_policy_gate: true
+  block_sensitive_data: true
