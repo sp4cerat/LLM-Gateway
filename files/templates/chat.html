@@ -737,7 +737,12 @@ function addMessage(role, content, meta = null, images = []) {
     if (meta.latency_ms) html += `<span class="tag tokens">⏱ ${Math.round(meta.latency_ms)}ms</span>`;
 
     const u = meta.usage;
-    if (u) html += `<span class="tag tokens">📊 ${u.prompt_tokens}+${u.completion_tokens} tok</span>`;
+    if (u) {
+      let tokStr = `📊 ${u.prompt_tokens}+${u.completion_tokens} tok`;
+      if (u.reasoning_tokens) tokStr += ` (🧠${u.reasoning_tokens})`;
+      if (u.cache_read_tokens) tokStr += ` (📦${u.cache_read_tokens})`;
+      html += `<span class="tag tokens">${tokStr}</span>`;
+    }
 
     // Vision info
     if (meta.vision_strategy) {
@@ -755,6 +760,17 @@ function addMessage(role, content, meta = null, images = []) {
     // Cascade
     if (meta.cascade_escalated) html += `<span class="tag tier">⬆ cascade→${meta.cascade_escalated}</span>`;
     if (meta.size_escalated) html += `<span class="tag tier">📏 size-escalated</span>`;
+
+    // Routing classification
+    const rt = meta.routing;
+    if (rt) {
+      let parts = [];
+      if (rt.layer) parts.push(rt.layer);
+      if (rt.action) parts.push(rt.action);
+      if (rt.response_type) parts.push(rt.response_type);
+      if (rt.is_code) parts.push('🔨code');
+      if (parts.length) html += `<span class="tag tokens">🧭 ${parts.join(' → ')}</span>`;
+    }
 
     html += '</div>';
   }
