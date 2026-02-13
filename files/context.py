@@ -115,6 +115,26 @@ class ContextBudget:
                         ))
                 break
 
+        # ── Post-trim cleanup: fix orphaned tool messages ──
+        # Context trimming can cut in the middle of a tool-call sequence:
+        #   tool(no tid) → assistant(tc) → tool(tid) → ...
+        # Google/Gemini rejects tool messages without tool_call_id.
+        # Strip leading messages until we reach a valid conversation start
+        # (developer, system, user, or assistant without tool_call dependency).
+        while trimmed:
+            first = trimmed[0]
+            if first.role == "tool":
+                # Orphaned tool result — no matching assistant+tool_call before it
+                trimmed.pop(0)
+            elif (first.role == "assistant"
+                  and getattr(first, 'tool_calls', None)
+                  and not getattr(first, 'content', None)):
+                # Assistant with only tool_calls but no content — the tool results
+                # that follow may also be orphaned if they reference earlier context
+                trimmed.pop(0)
+            else:
+                break
+
         return trimmed, max_output
 
 

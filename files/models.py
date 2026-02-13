@@ -4,7 +4,7 @@ Pydantic models for requests, responses, configuration, and internal types.
 """
 
 from enum import Enum
-from typing import Optional, Union
+from typing import Any, Optional, Union
 from pydantic import BaseModel, Field
 from datetime import datetime
 
@@ -25,13 +25,14 @@ class RouterResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     response_type: str = "explanation_generic"
     reason: str = ""
+    is_code_generation: bool = False
 
 
 # ─── API Request/Response (OpenAI-Compatible) ────────────────────────────────
 
 class ChatMessage(BaseModel):
     """
-    OpenAI-compatible chat message with multimodal support.
+    OpenAI-compatible chat message with multimodal and tool-calling support.
     
     content can be:
       - str: Plain text message
@@ -41,13 +42,20 @@ class ChatMessage(BaseModel):
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
             {"type": "file", "file": {"url": "data:application/pdf;base64,..."}},
           ]
+      - None: When message only contains tool_calls
     """
-    role: str = Field(..., description="Role: system, user, assistant, tool")
-    content: Union[str, list] = Field(..., description="Message content (text or multimodal list)")
+    role: str = Field(..., description="Role: system, user, assistant, tool, developer")
+    content: Optional[Union[str, list]] = Field(default=None, description="Message content (text or multimodal list)")
+    # OpenAI tool calling fields
+    tool_calls: Optional[list[dict]] = Field(default=None, description="Tool calls from assistant")
+    tool_call_id: Optional[str] = Field(default=None, description="Tool call ID for tool result messages")
+    name: Optional[str] = Field(default=None, description="Function name for tool result messages")
 
     @property
     def text_content(self) -> str:
         """Extract only the text from content, regardless of format."""
+        if self.content is None:
+            return ""
         if isinstance(self.content, str):
             return self.content
         if isinstance(self.content, list):
@@ -64,7 +72,7 @@ class ChatMessage(BaseModel):
     @property
     def has_media(self) -> bool:
         """Check if message contains images, files, or other media."""
-        if isinstance(self.content, str):
+        if self.content is None or isinstance(self.content, str):
             return False
         if isinstance(self.content, list):
             for item in self.content:
@@ -145,6 +153,10 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=4096, ge=1, le=32000)
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
     stream: bool = Field(default=False)
+    # OpenAI-compatible tool fields (used by agents like OpenClaw)
+    tools: Optional[list[dict]] = Field(default=None, description="Tool/function definitions")
+    tool_choice: Optional[Any] = Field(default=None, description="Tool choice strategy")
+    parallel_tool_calls: Optional[bool] = Field(default=None, description="Allow parallel tool calls")
     # Gateway-specific extensions
     fingerprint: Optional[str] = Field(default=None, description="Working-tree fingerprint")
     project_path: Optional[str] = Field(default=None, description="Project path for context")
@@ -160,6 +172,7 @@ class UsageInfo(BaseModel):
     total_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
     estimated_cost_usd: float = 0.0
 
 
@@ -294,10 +307,13 @@ class GatewayConfig(BaseModel):
     routing_strategy: str = "cost_optimized"
     mock_mode: bool = False
     web_search: "WebSearchConfig" = None  # type: ignore
+    code_generation: "CodeGenerationConfig" = None  # type: ignore
 
     def model_post_init(self, __context):
         if self.web_search is None:
             self.web_search = WebSearchConfig()
+        if self.code_generation is None:
+            self.code_generation = CodeGenerationConfig()
 
 
 class WebSearchConfig(BaseModel):
@@ -322,3 +338,15 @@ class WebSearchConfig(BaseModel):
     # Multi-query
     multi_query: bool = True         # Allow model to issue multiple search queries
     max_queries: int = 3             # Max parallel queries per search call
+
+
+class CodeGenerationConfig(BaseModel):
+    """Code generation routing configuration."""
+    # Minimum tier for code generation tasks in agent sessions
+    # Options: "cheap", "medium", "premium", "custom"
+    min_tier: str = "medium"
+    # Custom OpenRouter model (only used when min_tier="custom")
+    custom_model: str = ""
+    # Detection: which agent tools indicate code generation
+    code_tool_names: list[str] = ["exec", "write", "create_file", "edit_file",
+                                   "patch_file", "sub_agent"]

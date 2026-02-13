@@ -221,6 +221,11 @@ TOOL_DEFINITIONS = [
 
 TOOL_CASCADE_SYSTEM_PROMPT = """You are a fast, helpful assistant with access to real-time tools.
 
+LANGUAGE: ALWAYS respond in the SAME language as the user's message.
+If the user writes in German → respond in German.
+If the user writes in English → respond in English.
+NEVER respond in English to a German question or vice versa.
+
 WHEN TO USE TOOLS:
 - Use get_weather for ANY weather/temperature/forecast question
 - Use get_stock_price for ANY stock/crypto/market question
@@ -240,6 +245,11 @@ CRITICAL RULES:
 - For "was gibt es zu [topic]" → ALWAYS use web_search
 - NEVER output code blocks, API calls, or Python code as a response
 - NEVER say "I will perform a search" — just DO the search by calling the tool
+- NEVER ask the user for clarification instead of searching — ALWAYS search first, then answer
+- NEVER say "benötige ich weitere Informationen" or "können Sie mir mehr Details geben" — just SEARCH
+- If the question is broad, search with reasonable default assumptions. Example:
+  "günstigste LLM Router" → search for "cheapest LLM router proxy pricing comparison 2026"
+  Do NOT ask "which LLM do you want to use?" — just search and present what you find
 - If a tool returns no relevant results, answer from your knowledge and say "based on my training data"
 
 WEB SEARCH DEPTH — choose search_depth based on complexity:
@@ -266,6 +276,12 @@ MULTI-QUERY — for medium/max depth, use additional_queries with DIFFERENT keyw
                          "FQAD mitochondrial damage therapy 2025"]
   This finds complementary information that a single query would miss.
   For min depth or simple lookups, don't use additional_queries.
+
+QUERY QUALITY — write search queries that avoid ambiguity:
+  - If a word has multiple meanings, add context: "Münster Konstanz Höhe" (NOT "Münster Höhe" which finds the CITY Münster)
+  - Use the full proper name: "Konstanzer Münster" instead of just "Münster in Konstanz"
+  - For buildings/landmarks, add the type: "Kathedrale Konstanz Höhe Turm"
+  - For local businesses, add the city: "Restaurant Seeblick Überlingen" not just "Restaurant Seeblick"
 
 ANALYSIS MODE — choose the right analysis type:
   factual (default):
@@ -453,7 +469,7 @@ ANTWORT-REGELN:
 - Gib Quellen an (Name oder URL), wenn du daraus zitierst
 - Wenn die Suchergebnisse die Frage nicht beantworten: nutze dein Trainingswissen und sage kurz, dass die Webrecherche keine passenden Ergebnisse lieferte
 - Gib NIEMALS auf — beantworte die Frage IMMER, notfalls aus deinem Wissen
-- Antworte in der Sprache des Nutzers
+- SPRACHE: Antworte IMMER in der Sprache der Nutzerfrage. Deutsche Frage → Deutsche Antwort. NIEMALS Englisch antworten wenn die Frage auf Deutsch ist.
 - Keine Code-Blöcke, keine API-Aufrufe"""
 
 # ── Analysis-mode specific frameworks ──
@@ -593,7 +609,18 @@ Qualitäts-Check:
 □ Fehlt eine Dimension die in den Quellen abgedeckt ist?
 
 Falls Mängel bei Pflicht-Checks → überarbeite die Stellen BEVOR du antwortest.
-Falls Mängel bei Qualitäts-Checks → verbessere gezielt."""
+Falls Mängel bei Qualitäts-Checks → verbessere gezielt.
+
+ANTWORT-BEWERTUNG (PFLICHT — am ENDE deiner Antwort):
+Füge als ALLERLETZTE Zeile diesen Block ein (wird vom System entfernt, der Nutzer sieht ihn nicht):
+<!--QUALITY:{"answered":true/false,"confidence":"high"/"medium"/"low","source_count":N,"has_facts":true/false,"retry":null}-->
+- answered: true wenn die Frage konkret beantwortet wurde, false wenn nur ausgewichen/verwiesen
+- confidence: high=Fakten direkt aus Quellen extrahiert, medium=teilweise aus Quellen, low=kaum/keine brauchbaren Quellen
+- source_count: Anzahl tatsächlich genutzter Quellen (0-5)
+- has_facts: true wenn konkrete Fakten/Zahlen/Daten/Termine extrahiert wurden
+- retry: null wenn Antwort ausreichend. Sonst ein Objekt mit Nachsuche-Empfehlung:
+  {"queries":["besserer Suchbegriff 1","..."],"time_filter":"d"/"w"/"m"/"none","reason":"kurze Begründung"}
+  Empfehle retry wenn: Quellen irrelevant, falsche Sprache, zu wenig Fakten, Frage nur teilweise beantwortet"""
 
 # ── The dynamic builder ──
 
@@ -631,15 +658,20 @@ def build_synthesis_prompt(
     # Build the prompt
     parts = []
 
+    # Current date for temporal context
+    from datetime import datetime as _dt
+    _today = _dt.now().strftime("%d.%m.%Y")
+
     # Role
     if depth == "thorough" or analysis_mode == "strategic":
-        parts.append("Du bist ein Senior-Analyst auf Beratungsniveau. Dir wurden "
-                      "umfangreiche Webinhalte zu einer komplexen Frage bereitgestellt.")
+        parts.append(f"Du bist ein Senior-Analyst auf Beratungsniveau. Heutiges Datum: {_today}. "
+                      "Dir wurden umfangreiche Webinhalte zu einer komplexen Frage bereitgestellt.")
     elif depth == "deep":
-        parts.append("Du bist ein analytischer Recherche-Assistent. Dir wurden "
-                      "detaillierte Webinhalte zu einer Frage bereitgestellt.")
+        parts.append(f"Du bist ein analytischer Recherche-Assistent. Heutiges Datum: {_today}. "
+                      "Dir wurden detaillierte Webinhalte zu einer Frage bereitgestellt.")
     else:
-        parts.append("Du bist ein hilfreicher Assistent. Dir wurden Suchergebnisse bereitgestellt.")
+        parts.append(f"Du bist ein hilfreicher Assistent. Heutiges Datum: {_today}. "
+                      "Dir wurden Suchergebnisse bereitgestellt.")
 
     # Analysis framework
     parts.append(framework)
@@ -686,6 +718,8 @@ def build_synthesis_prompt(
         lang = output_architecture.get("language", "de")
         if lang == "en":
             arch_parts.append("\nRESPOND IN ENGLISH.")
+        else:
+            arch_parts.append(f"\nANTWORTE AUF DEUTSCH. Niemals auf Englisch antworten wenn die Frage auf Deutsch gestellt wurde.")
 
         parts.append("\n".join(arch_parts))
 
@@ -705,7 +739,7 @@ SYNTHESE-REGELN:
 - Strukturiere nach THEMATISCHEN ASPEKTEN, nicht nach Quellen
 - Quantitativ > qualitativ ("25-30%" statt "erheblich")
 - Studien/Reports > Zeitungsartikel > Meinungsbeiträge
-- Antworte in der Sprache des Nutzers
+- SPRACHE: Antworte IMMER in der Sprache der Nutzerfrage. Deutsche Frage → Deutsche Antwort. NIEMALS Englisch.
 - Keine Code-Blöcke, keine API-Aufrufe
 
 INHALT — ABSOLUT ZWINGEND:
@@ -1424,34 +1458,13 @@ async def tool_web_search(
         depth_map = {"min": "snippets", "medium": "deep", "max": "thorough"}
         depth = depth_map.get(search_depth, depth)
 
-    # ── Auto-upgrade: snippets → deep for complex queries ──
-    # The model often picks "snippets" for questions that need real page content.
-    # Upgrade if the query looks like it needs research (policy, analysis, comparison).
+    # ── Always upgrade snippets → deep ──
+    # Snippets (DDG results only) are rarely sufficient for quality answers.
+    # Deep downloads actual pages for full-text extraction.
+    # Cost difference is negligible (DDG + trafilatura are free).
     if depth == "snippets":
-        q_lower = query.lower()
-        _complex_indicators = [
-            # German research keywords
-            "was sieht", "was plant", "wie ändert", "wie verändert",
-            "auswirkungen", "konsequenzen", "reform", "gesetz", "verordnung",
-            "vergleich", "unterschied", "analyse", "studie", "prognose",
-            "vor- und nachteile", "stabilisieren", "strategie", "konzept",
-            # German event/local queries (need page content, not just snippets)
-            "veranstaltung", "event", "programm", "was gibt es",
-            "was ist los", "was kann man", "interessant für",
-            # English research keywords
-            "what are the", "how does", "compare", "impact", "consequences",
-            "analysis", "policy", "reform", "regulation", "strategy",
-            "what events", "things to do", "interesting for tourists",
-            # Question complexity: >8 words or contains analytical keywords
-        ]
-        _is_complex = (
-            any(ind in q_lower for ind in _complex_indicators)
-            or len(query.split()) > 10
-        )
-        if _is_complex:
-            depth = "deep"
-            log.info(f"web_search: auto-upgrade snippets→deep for complex query: "
-                     f"'{query[:60]}'")
+        depth = "deep"
+        log.info(f"web_search: auto-upgrade snippets→deep for query: '{query[:60]}'")
 
     # ── Resolve max_pages from config + depth ──
     DEPTH_DEFAULTS = {
@@ -1508,6 +1521,10 @@ async def tool_web_search(
             _snippet_footer = _extract_source_footer_from_snippets(snippets)
             if _snippet_footer:
                 _set_source_footer(_snippet_footer)
+                log.info(f"Snippet source footer: {_snippet_footer.count('[')} refs, "
+                         f"{len(_snippet_footer)} chars")
+            else:
+                log.info("Snippet source footer: no URLs extracted from snippets")
 
         return snippets
 

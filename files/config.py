@@ -8,7 +8,7 @@ import yaml
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
-from models import GatewayConfig, ProviderConfig, CacheConfig, BudgetConfig, RateLimitConfig, SecurityConfig, WebSearchConfig
+from models import GatewayConfig, ProviderConfig, CacheConfig, BudgetConfig, RateLimitConfig, SecurityConfig, WebSearchConfig, CodeGenerationConfig
 
 log = logging.getLogger("gateway.config")
 
@@ -46,6 +46,7 @@ def load_config() -> GatewayConfig:
     rate_limits_yaml = yaml_config.get("rate_limits", {})
     security_yaml = yaml_config.get("security", {})
     web_search_yaml = yaml_config.get("web_search", {})
+    code_generation_yaml = yaml_config.get("code_generation", {})
 
     config = GatewayConfig(
         host=os.environ.get("GATEWAY_HOST", yaml_config.get("host", "0.0.0.0")),
@@ -76,6 +77,7 @@ def load_config() -> GatewayConfig:
         rate_limits=RateLimitConfig(**{**RateLimitConfig().model_dump(), **rate_limits_yaml}),
         security=SecurityConfig(**{**SecurityConfig().model_dump(), **security_yaml}),
         web_search=WebSearchConfig(**{**WebSearchConfig().model_dump(), **web_search_yaml}),
+        code_generation=CodeGenerationConfig(**{**CodeGenerationConfig().model_dump(), **code_generation_yaml}),
     )
 
     return config

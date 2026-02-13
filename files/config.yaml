@@ -29,9 +29,9 @@ providers:
   cheap_provider: "openrouter"
   cheap_model: "google/gemini-2.0-flash-001"               # ~$0.10/M — fast, real-time data, greetings/lookups
   cheap_plus_provider: "openrouter"
-  cheap_plus_model: "google/gemini-3-flash-preview"        # ~$0.10/$0.40/M + $0.02/search — real-time data (weather, stocks, news)
+  cheap_plus_model: "google/gemini-2.0-flash-001"          # ~$0.10/$0.40/M + web search — real-time data (weather, stocks, news)
   medium_provider: "openrouter"
-  medium_model: "google/gemini-3-flash-preview"             # ~$0.10/$0.40/M — explanations, moderate code
+  medium_model: "google/gemini-3-flash-preview"             # ~$0.50/$3.00/M — explanations, moderate code, reasoning
   premium_provider: "openrouter"
   premium_model: "google/gemini-2.5-pro"                    # ~$1.25/$10/M — complex reasoning, architecture, translation
   embedding_provider: "openrouter"
@@ -95,3 +95,20 @@ web_search:
   engines: ["ddg"]           # Search engines (order = priority): "ddg", "google", "bing"
   multi_query: true          # Allow model to issue multiple parallel search queries
   max_queries: 3             # Max parallel queries per search call (1-5)
+
+# ─── Code Generation (Agent Sessions) ─────────────────────────────────────────
+# Controls model selection for code generation in OpenClaw agent sessions.
+# When the agent calls code tools (exec, write, etc.), the gateway escalates
+# to a better model for higher-quality code output.
+code_generation:
+  # Minimum tier for code tasks: "cheap", "medium", "premium", "custom"
+  #   cheap   = Gemini 2.0 Flash (fast, basic quality)
+  #   medium  = Gemini 3 Flash (good balance, recommended)
+  #   premium = Gemini 2.5 Pro (best quality, expensive)
+  #   custom  = Use custom_model below
+  min_tier: "medium"
+  # Custom OpenRouter model (only used when min_tier="custom")
+  # Example: "anthropic/claude-sonnet-4-20250514", "openai/gpt-4o"
+  custom_model: ""
+  # Agent tool names that indicate code generation
+  code_tool_names: ["exec", "write", "create_file", "edit_file", "patch_file", "sub_agent"]

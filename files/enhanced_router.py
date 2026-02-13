@@ -41,6 +41,7 @@ class EnhancedRouterResult:
     strategy: str = "direct"  # direct, retrieve_then_solve, map_reduce, verify
     routing_layer: str = "unknown"  # deterministic, heuristic, utility, llm
     utility_score: float = 0.0
+    is_code_generation: bool = False
 
     def to_router_result(self) -> RouterResult:
         """Convert to standard RouterResult for backward compatibility."""
@@ -49,6 +50,7 @@ class EnhancedRouterResult:
             confidence=self.confidence,
             response_type=self.response_type,
             reason=f"{self.routing_layer}:{self.reason}",
+            is_code_generation=self.is_code_generation,
         )
 
 
@@ -281,6 +283,7 @@ class EnhancedRouter:
                     routing_layer="llm",
                     utility_score=utility,
                     strategy=self._pick_strategy(llm_result.action, ctx, context_map),
+                    is_code_generation=llm_result.is_code_generation,
                 )
                 self._log_decision(result, start)
                 return result
@@ -288,6 +291,22 @@ class EnhancedRouter:
             except Exception as e:
                 log.warning(f"LLM router failed in enhanced routing: {e}")
                 # Fall through to utility-based decision
+
+        # ─── Layer 4b: Code Detection for low-utility queries ─────
+        # For cheap-tier queries, still ask the LLM if this is code generation.
+        # Don't override tier — only set is_code_generation flag.
+        # Groq calls are ~free (<0.001ct) and ~50ms.
+        _llm_code_flag = False
+        if utility <= 0.25 and self.llm_router and tier in (
+            RouterAction.CHEAP, RouterAction.LOCAL
+        ):
+            try:
+                llm_result = await self.llm_router.route(query)
+                _llm_code_flag = llm_result.is_code_generation
+                if _llm_code_flag:
+                    log.info(f"EnhancedRouter: LLM detected code_generation for low-utility query")
+            except Exception:
+                pass  # Non-critical, fall through
 
         # Use utility-based decision
         result = EnhancedRouterResult(
@@ -299,6 +318,7 @@ class EnhancedRouter:
             utility_score=utility,
             strategy=self._pick_strategy(tier, ctx, context_map),
             needed_chunks=self._select_relevant_chunks(query, context_map),
+            is_code_generation=_llm_code_flag,
         )
         self._log_decision(result, start)
         return result
@@ -482,6 +502,8 @@ class EnhancedRouter:
         log.info(
             f"EnhancedRouter: {result.action.value} | layer={result.routing_layer} | "
             f"strategy={result.strategy} | conf={result.confidence:.2f} | "
-            f"utility={result.utility_score:.2f} | chunks={result.needed_chunks} | "
+            f"utility={result.utility_score:.2f} | "
+            f"code_gen={result.is_code_generation} | "
+            f"chunks={result.needed_chunks} | "
             f"reason={result.reason} | {latency:.0f}ms"
         )

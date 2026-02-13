@@ -20,6 +20,7 @@ import base64
 import asyncio
 import httpx
 import logging
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -100,6 +101,9 @@ exact_cache: ExactCache = None
 semantic_cache: SemanticCache = None
 providers: dict[str, LLMProvider] = {}
 gateway_secret: str = ""
+
+# ─── Debug Buffer (last N requests for /debug view) ──────────────────────────
+_debug_buffer: deque = deque(maxlen=10)
 enhanced_router: EnhancedRouter = None  # v2: multi-layer router
 data_collector: FreeDataCollector = None  # Free API data collector (weather, stocks, news)
 
@@ -111,6 +115,7 @@ async def lifespan(app: FastAPI):
     """Initialize all gateway components on startup."""
     global config, rate_limiter, budget_guard, idempotency
     global intent_router, exact_cache, semantic_cache, providers, gateway_secret
+    global enhanced_router
 
     log.info("=" * 60)
     log.info("  LLM Gateway v1.5 - Cost-Optimized AI Routing with Tool Calling")
@@ -148,6 +153,11 @@ async def lifespan(app: FastAPI):
 
     log.info(f"Gateway ready on {config.host}:{config.port}")
     log.info(f"Mock mode: {'ON' if config.mock_mode else 'OFF'}")
+    _cg = config.code_generation
+    if _cg.min_tier == "custom" and _cg.custom_model:
+        log.info(f"Code generation: custom model → {_cg.custom_model}")
+    else:
+        log.info(f"Code generation: min_tier={_cg.min_tier}")
     log.info("=" * 60)
 
     # Start background tasks
@@ -391,6 +401,18 @@ async def _llm_call_with_retry(provider, max_retries=1, retry_delay=3.0, **kwarg
 # ─── Code Stitching (continue truncated cheap-model output) ──────────────────
 
 _CODE_STITCH_MAX_ROUNDS = 2   # Max continuation calls (repair step is the fallback)
+
+def _msg_to_dict(msg) -> dict:
+    """Convert ChatMessage to OpenAI-compatible dict, preserving tool fields."""
+    d = {"role": msg.role, "content": msg.content if msg.content is not None else ""}
+    if getattr(msg, 'tool_calls', None):
+        d["tool_calls"] = msg.tool_calls
+    if getattr(msg, 'tool_call_id', None):
+        d["tool_call_id"] = msg.tool_call_id
+    if getattr(msg, 'name', None):
+        d["name"] = msg.name
+    return d
+
 
 def _has_code_content(content: str) -> bool:
     """
@@ -853,9 +875,10 @@ def _filter_source_footer(llm_response: str, source_footer: str) -> tuple[str, s
         for num_str in re.findall(r'\d+', m):
             referenced_nums.add(int(num_str))
 
-    # If no numbered references found, return all sources (can't filter)
+    # If no numbered references found at all, the model didn't use any sources
+    # This usually means the sources were irrelevant — don't return footer
     if not referenced_nums:
-        return llm_response, source_footer
+        return llm_response, ""
 
     # Parse footer lines and keep only referenced ones, building renumber map
     footer_lines = source_footer.strip().split("\n")
@@ -1156,6 +1179,43 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                         log.debug(f"[{request_id}] Image fingerprint: {fingerprint[-40:]}")
                     break
 
+        # ─── Detect OpenClaw/Agent sessions ─────────────────────────────
+        # OpenClaw sends system prompts containing "default_api", "execute_ipython",
+        # "openclaw" etc. These sessions use code-execution patterns that look like
+        # hallucinated code to our guards. We must skip those guards for agent sessions.
+        # Check ALL messages (system, user, assistant) because OpenClaw may embed
+        # its instructions in user messages or conversation history.
+        _is_agent_session = False
+        _agent_signals = [
+            # System prompt signals
+            "default_api", "execute_ipython", "openclaw", "openhands",
+            "IPythonRunCellAction", "CmdRunAction", "BrowserAction",
+            "execute_bash", "<execute_ipython>",
+            # Path signals (OpenClaw workspace paths in history)
+            "/root/.openclaw/", ".openclaw/workspace",
+            # Action format signals
+            "OBSERVATION:", "ACTION:", "AgentDelegateAction",
+            "FileReadAction", "FileWriteAction",
+        ]
+        for msg in request.messages:
+            if msg.text_content:
+                _msg_text = msg.text_content
+                if any(sig.lower() in _msg_text.lower() for sig in _agent_signals):
+                    _is_agent_session = True
+                    _matched = [s for s in _agent_signals if s.lower() in _msg_text.lower()]
+                    log.info(f"[{request_id}] Agent session detected "
+                             f"(signal '{_matched[0]}' in {msg.role} message)")
+                    break
+        
+        if not _is_agent_session:
+            log.info(f"[{request_id}] No agent session detected "
+                     f"(checked {len(request.messages)} messages)")
+            # Log message summary for debugging agent detection misses
+            for i, msg in enumerate(request.messages[:5]):  # First 5 messages
+                _preview = msg.text_content[:150].replace('\n', ' ') if msg.text_content else "(empty)"
+                log.info(f"[{request_id}] msg[{i}] role={msg.role} len={len(msg.text_content or '')} "
+                         f"preview='{_preview}'")
+        
         # ─── Step 1: Hard Policy Gate ─────────────────────────────────
         if config.security.enable_policy_gate:
             # Only check the user's actual question, not extracted document content
@@ -1196,8 +1256,9 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
 
         # ─── Step 4: Exact Cache ──────────────────────────────────────
         # Image hash is part of fingerprint → same query + different image = cache miss
+        # Skip cache for agent sessions — context changes with each tool result
         cache_query = user_query
-        if config.cache.exact_cache_enabled and not no_cache:
+        if config.cache.exact_cache_enabled and not no_cache and not _is_agent_session:
             exact_hit = exact_cache.get(cache_query, fingerprint)
             if exact_hit:
                 latency = (time.time() - start_time) * 1000
@@ -1219,6 +1280,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         full_context_text = ""
         is_doc_qa = False
         _expects_long_code = False  # Set by code upgrade, used by post-validation
+        _needs_web_search = False   # Set by planning/web keyword detection
         tier = None  # Will be set by routing logic below
 
         if request.model and request.model != "auto":
@@ -1290,17 +1352,33 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     CHEAP_MAX_TOKENS = 50000
                     MEDIUM_MAX_TOKENS = 100000
                     routing_tokens = total_request_tokens  # Doc size matters
+                    _routing_query = user_query  # No stripping needed for doc QA
                 else:
                     CHEAP_MAX_TOKENS = 500
                     MEDIUM_MAX_TOKENS = 3000
                     # Use QUERY complexity for routing, not total request size
                     # OpenClaw/chat clients add 2000-5000 tok of system prompt + history
                     # A simple "Wie wird das Wetter" should stay cheap regardless
-                    routing_tokens = estimate_tokens(user_query)
+                    _routing_query = user_query
+                    # Agent sessions: OpenClaw prepends system logs (exec failures, etc.)
+                    # to user messages, inflating token count. Extract actual user text.
+                    # Pattern: "System: [...] ...\n\n[Telegram Sven ...] actual message"
+                    if _is_agent_session and "\n" in _routing_query:
+                        # Find the actual Telegram message after system logs
+                        _tg_match = re.search(
+                            r'\[Telegram [^\]]+\]\s*(.+?)(?:\s*\[message_id:\s*\d+\])?\s*$',
+                            _routing_query, re.DOTALL
+                        )
+                        if _tg_match:
+                            _routing_query = _tg_match.group(1).strip()
+                            log.debug(f"[{request_id}] Agent routing: stripped system logs, "
+                                      f"query='{_routing_query[:80]}'")
+                    routing_tokens = estimate_tokens(_routing_query)
                 log.info(f"[{request_id}] Cascade routing: routing_tok={routing_tokens} | "
                          f"total_req_tok={total_request_tokens} | "
                          f"thresholds: cheap<{CHEAP_MAX_TOKENS} medium<{MEDIUM_MAX_TOKENS}"
                          f"{' [doc_qa]' if is_doc_qa else ''}")
+                _needs_web_search = False
                 if routing_tokens >= MEDIUM_MAX_TOKENS:
                     tier = "premium"
                     size_escalated_from = "cheap"
@@ -1314,9 +1392,8 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
 
                 # ── Web search upgrade: cheap → cheap_plus ──
                 # Detect queries that need web search even when token count is low.
-                # cheap_plus uses Gemini 3 Flash with web grounding.
                 if tier == "cheap":
-                    _q_lower = user_query.lower()
+                    _q_lower = _routing_query.lower()
                     _web_search_signals = [
                         # Explicit research requests (DE/EN)
                         "recherchiere", "recherche zu", "recherche über",
@@ -1327,8 +1404,6 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                         "finde heraus", "finde informationen", "suche nach",
                         "search for", "find out about",
                         # Real-time data
-                        "wetter", "weather", "temperatur", "aktienkurs",
-                        "stock price", "börsenkurs", "wechselkurs",
                         "aktuelle nachrichten", "latest news",
                         "spielstand", "score of", "ergebnis von",
                         "öffnungszeiten", "opening hours",
@@ -1339,25 +1414,32 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                                     "today", "live", "jetzt", "derzeit"]
                     _question_words = ["was", "wie", "what", "how", "wieviel",
                                        "welche", "which", "wann", "when"]
+                    _planning_kw = ["plant", "plans", "vorhaben", "position",
+                                    "wahlprogramm", "koalition", "regierung",
+                                    "gesetzentwurf", "reform", "beschlossen",
+                                    "policy", "legislation", "regulation"]
                     _has_realtime = any(kw in _q_lower for kw in _realtime_kw)
                     _has_question = any(w in _q_lower for w in _question_words)
+                    _has_planning = any(kw in _q_lower for kw in _planning_kw)
 
                     needs_web = (
                         any(sig in _q_lower for sig in _web_search_signals)
                         or (_has_realtime and _has_question)
+                        or (_has_planning and _has_question)
                     )
-                    # Exclude queries that are better handled by tool cascade
-                    # (e.g. stock prices via get_stock_price, weather via get_weather).
-                    # These need the cheap tier's TOOL_CASCADE_SYSTEM_PROMPT.
+                    # Exclude queries handled by dedicated tools (weather, stocks)
                     _tool_handled = ["dax", "aktie", "aktien", "börse", "stock",
                                      "share price", "kurs", "portfolio", "index",
-                                     "dow", "nasdaq", "s&p", "nikkei", "ftse"]
+                                     "dow", "nasdaq", "s&p", "nikkei", "ftse",
+                                     "wetter", "weather", "temperatur", "temperature",
+                                     "forecast", "vorhersage"]
                     if needs_web and any(t in _q_lower for t in _tool_handled):
                         needs_web = False
                         log.info(f"[{request_id}] Web upgrade suppressed: "
                                  f"query matches tool-handled pattern, staying on cheap")
                     if needs_web:
                         tier = "cheap_plus"
+                        _needs_web_search = True
                         log.info(f"[{request_id}] Web search upgrade: cheap → cheap_plus "
                                  f"(query needs web data)")
 
@@ -1365,9 +1447,9 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 # Only for LONG code tasks (200+ lines, full programs).
                 # Benchmark v3 shows Gemini 2.0 Flash is better at short code (96% vs 94%),
                 # but Gemini 3 Flash is more reliable for long code (no indent/diff bugs).
-                # Both cost the same ($0.10/$0.40/M), so this is free quality.
+                # Gemini 3 Flash ($0.50/$3.00/M) is better for complex code tasks.
                 if tier == "cheap":
-                    _q_lower = user_query.lower()
+                    _q_lower = _routing_query.lower()
                     _long_code_signals = [
                         # Explicit long/full program requests (DE)
                         "vollständiges programm", "vollständiges skript",
@@ -1407,7 +1489,87 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                         stream=request.stream
                     )
 
-        # ─── Step 5e: Vision Pipeline (images → preprocess → route) ─────
+        # ─── Step 5e: Code generation escalation ─────────────────────────
+        # Escalate to better model when code generation is detected.
+        # Detection layers (language-independent):
+        # 1. EnhancedRouter/IntentRouter LLM sets is_code_generation=True
+        # 2. LLM code detection call for small-context queries (test console)
+        # 3. Agent sessions: recent tool_calls for code tools (exec, write, sub_agent)
+        # NOTE: response_type="code_suggestion" is NOT used as signal — it fires
+        #       for questions ABOUT code too (false positives like "webroot" queries).
+        _agent_custom_model = None
+        if tier in ("cheap", "local"):
+            _code_cfg = config.code_generation
+            
+            # Check 1: LLM-classified code generation
+            _is_code = False
+            if enhanced_result and enhanced_result.is_code_generation:
+                _is_code = True
+            elif route_result and getattr(route_result, 'is_code_generation', False):
+                _is_code = True
+            
+            # Check 2: LLM code detection (when no router ran yet)
+            # This happens for small-context cascade queries (test console, simple API).
+            # Groq/OpenRouter call: ~50ms, ~0.001ct — negligible cost.
+            # ONLY trust the explicit is_code_generation flag, NOT response_type.
+            # (response_type=code_suggestion also fires for questions ABOUT code,
+            #  e.g. "Ist in deinem workspace ein webroot" → false positive)
+            if not _is_code and not enhanced_result and not route_result:
+                try:
+                    _code_check = await intent_router.route(user_query)
+                    route_result = _code_check  # Save for metadata display
+                    if _code_check.is_code_generation:
+                        _is_code = True
+                        log.info(f"[{request_id}] LLM code detection: is_code=True "
+                                 f"(action={_code_check.action.value}, "
+                                 f"rt={_code_check.response_type})")
+                    else:
+                        log.debug(f"[{request_id}] LLM code detection: is_code=False "
+                                  f"(action={_code_check.action.value}, "
+                                  f"rt={_code_check.response_type})")
+                except Exception as e:
+                    log.debug(f"[{request_id}] LLM code detection failed: {e}")
+            
+            # Check 3: Agent sessions — recent tool_calls for code tools
+            # Only check last 4 messages (current exchange), not deep history,
+            # to avoid false positives when user switched topics after coding.
+            # SKIP when last message is a tool result: the tier was already decided
+            # on the previous call; this is just processing output (e.g. exec ls).
+            _last_is_tool_result = (
+                request.messages and request.messages[-1].role == "tool"
+            )
+            if not _is_code and _is_agent_session and not _last_is_tool_result:
+                _code_tools = set(_code_cfg.code_tool_names)
+                for msg in reversed(request.messages[-4:]):
+                    if getattr(msg, 'tool_calls', None):
+                        for tc in msg.tool_calls:
+                            _tc_name = tc.get("function", {}).get("name", "")
+                            if _tc_name in _code_tools:
+                                _is_code = True
+                                break
+                    if _is_code:
+                        break
+            
+            if _is_code:
+                _old_tier = tier
+                _source = (
+                    "is_code_generation" if (
+                        (enhanced_result and enhanced_result.is_code_generation)
+                        or (route_result and getattr(route_result, 'is_code_generation', False))
+                    ) else "agent_tool_history"
+                )
+                if _code_cfg.min_tier == "custom" and _code_cfg.custom_model:
+                    _agent_custom_model = _code_cfg.custom_model
+                    tier = "medium"  # Use medium provider slot but override model
+                    log.info(f"[{request_id}] Code escalation: {_old_tier} → "
+                             f"custom model ({_agent_custom_model}) [{_source}]")
+                elif _code_cfg.min_tier in ("medium", "premium"):
+                    tier = _code_cfg.min_tier
+                    log.info(f"[{request_id}] Code escalation: {_old_tier} → "
+                             f"{tier} (config min_tier={_code_cfg.min_tier}) [{_source}]")
+                # "cheap" min_tier = no escalation
+
+        # ─── Step 5f: Vision Pipeline (images → preprocess → route) ─────
         # Safety net: if no routing path set tier, default to cheap
         if tier is None:
             log.warning(f"[{request_id}] No routing path set tier, defaulting to cheap")
@@ -1533,7 +1695,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
             await asyncio.sleep(budget_result["delay"])
 
         # ─── Step 8: Semantic Cache (if enabled) ──────────────────────
-        if config.cache.semantic_cache_enabled and not no_cache and tier in ("cheap", "cheap_plus", "medium", "premium"):
+        if config.cache.semantic_cache_enabled and not no_cache and not _is_agent_session and tier in ("cheap", "cheap_plus", "medium", "premium"):
             embedding_fn = None
             if "embedding" in providers:
                 embedding_fn = providers["embedding"].get_embedding
@@ -1593,6 +1755,10 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         # ─── Step 11: LLM Call (with Tool Calling + Cascade) ──────────
         provider = _get_provider_for_tier(tier)
         model = _get_model_for_tier(tier)
+        # Override with custom model for agent code generation
+        if _agent_custom_model:
+            model = _agent_custom_model
+            log.info(f"[{request_id}] Using custom code model: {model}")
 
         # Build system prompt
         # Skip tool cascade for long content — tool calling is for short queries
@@ -1604,9 +1770,62 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         user_query_tokens = estimate_tokens(user_query)
         is_document_analysis = (user_query_tokens > 300 or
                                 (user_query_tokens > 100 and is_doc_qa))
-        if cascade_mode and tier == "cheap" and not size_escalated_from and not is_document_analysis:
+        if cascade_mode and tier in ("cheap", "cheap_plus") and not size_escalated_from and not is_document_analysis:
             # Tool-aware cascade: cheap model decides what tools to call
-            system_prompt = TOOL_CASCADE_SYSTEM_PROMPT
+            # SKIP for agent sessions — OpenClaw has its own system prompt and tools
+            if _is_agent_session:
+                # Don't use system_prompt (gets buried under OpenClaw's 16k developer message).
+                # Instead inject hints directly into trimmed_messages near the end,
+                # right before the last user message, where Gemini will actually see them.
+                system_prompt = ""
+                from datetime import datetime as _dt_hint
+                _today_hint = _dt_hint.now().strftime("%d.%m.%Y")
+                _tool_hint = ChatMessage(
+                    role="system",
+                    content=(
+                        f"Heutiges Datum: {_today_hint}\n\n"
+                        "CRITICAL TOOL RULES (MUST FOLLOW):\n"
+                        "1. NEVER output Python code as text. No print(), no default_api calls as text.\n"
+                        "2. For ANY factual question, knowledge, news, politics, events → call web_search tool\n"
+                        "3. For weather → call get_weather tool\n"
+                        "4. For stock prices → call get_stock_price tool\n"
+                        "5. memory_search is ONLY for recalling past user conversations. "
+                        "NEVER use memory_search for general knowledge questions.\n"
+                        "6. ALWAYS respond in the SAME language as the user's message.\n"
+                        "7. WEB SEARCH QUALITY: When calling web_search, use these parameters:\n"
+                        '   - search_depth: "medium" (downloads full pages, not just snippets)\n'
+                        '   - additional_queries: add 1-2 alternative search terms for better coverage\n'
+                        '   - time_filter: Choose based on the query:\n'
+                        '     "d" = last 24h → for "heute", "today", breaking news, live events\n'
+                        '     "w" = last week → for "diese Woche", current events, recent prices\n'
+                        '     "m" = last month → for recent studies, policy changes, new products\n'
+                        '     "none" = no limit → for laws, regulations, research, established facts\n'
+                        '   Example: web_search(query="Veranstaltungen Konstanz Februar 2026",\n'
+                        '            search_depth="medium", time_filter="w",\n'
+                        '            additional_queries=["Events Bodensee Wochenende"])\n'
+                        '   Example: web_search(query="EU Batterieverordnung 2026",\n'
+                        '            search_depth="medium", time_filter="none")'
+                        + ("\n⚠️ THIS QUERY REQUIRES CURRENT DATA. You MUST call web_search "
+                           "before answering. Do NOT answer from memory alone."
+                           if _needs_web_search else "")
+                    ),
+                )
+                # Insert before last user message
+                _last_user_idx = None
+                for _i in range(len(trimmed_messages) - 1, -1, -1):
+                    if trimmed_messages[_i].role == "user":
+                        _last_user_idx = _i
+                        break
+                if _last_user_idx is not None:
+                    trimmed_messages.insert(_last_user_idx, _tool_hint)
+                else:
+                    trimmed_messages.append(_tool_hint)
+                use_tools = False
+                log.info(f"[{request_id}] Agent session → tool hints injected before last user msg")
+            else:
+                from datetime import datetime as _dt
+                _today_str = _dt.now().strftime("%d.%m.%Y")
+                system_prompt = f"Heutiges Datum: {_today_str}\n\n" + TOOL_CASCADE_SYSTEM_PROMPT
         elif tier == "premium":
             system_prompt = STATIC_SYSTEM_PROMPT
         else:
@@ -1624,7 +1843,9 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     )
 
         # Pass tool definitions only for cheap cascade mode (short queries)
-        use_tools = (cascade_mode and tier == "cheap" and not size_escalated_from and not is_document_analysis)
+        # SKIP for agent sessions — OpenClaw has its own tools, gateway tools would interfere
+        use_tools = (cascade_mode and tier in ("cheap", "cheap_plus") and not size_escalated_from
+                     and not is_document_analysis and not _is_agent_session)
         if is_document_analysis and tier == "cheap":
             log.info(f"[{request_id}] Document analysis detected "
                      f"(query_tok={user_query_tokens}, total={total_request_tokens}) "
@@ -1635,6 +1856,42 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                  f"query_tok={user_query_tokens} | total_req_tok={total_request_tokens} | "
                  f"is_doc_qa={is_doc_qa} | model={request.model}")
 
+        # Determine which tools to pass to the LLM
+        # For agent sessions: merge client tools + gateway tools so the model can
+        # use web_search/weather/stocks AND the agent's own tools (exec, write, etc.)
+        _gateway_tool_names = set()
+        if _is_agent_session and request.tools:
+            _gateway_tool_names = {t["function"]["name"] for t in TOOL_DEFINITIONS
+                                   if "function" in t}
+            # Merge: client tools + gateway tools (skip duplicates)
+            _client_tool_names = set()
+            for t in request.tools:
+                fname = t.get("function", {}).get("name", "")
+                if fname:
+                    _client_tool_names.add(fname)
+            # Add gateway tools that the client doesn't already provide
+            _extra_gateway = [t for t in TOOL_DEFINITIONS
+                              if t.get("function", {}).get("name") not in _client_tool_names]
+            _effective_tools = list(request.tools) + _extra_gateway
+            log.info(f"[{request_id}] Agent session: {len(request.tools)} client tools + "
+                     f"{len(_extra_gateway)} gateway tools = {len(_effective_tools)} total")
+        elif use_tools:
+            _effective_tools = TOOL_DEFINITIONS  # Gateway tools only
+        else:
+            _effective_tools = None
+
+        # Log message structure for agent session debugging
+        if _is_agent_session:
+            _msg_summary = []
+            for i, m in enumerate(trimmed_messages):
+                _has_tc = bool(getattr(m, 'tool_calls', None))
+                _has_tcid = bool(getattr(m, 'tool_call_id', None))
+                _clen = len(m.text_content) if m.text_content else 0
+                _msg_summary.append(f"{m.role}({'tc' if _has_tc else ''}"
+                                    f"{'tid' if _has_tcid else ''}"
+                                    f",{_clen}c)")
+            log.info(f"[{request_id}] Agent messages: {' → '.join(_msg_summary)}")
+
         llm_result = await _llm_call_with_retry(
             provider,
             messages=trimmed_messages,
@@ -1643,7 +1900,8 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
             temperature=request.temperature or 0.7,
             system_prompt=system_prompt,
             use_cache=use_cache,
-            tools=TOOL_DEFINITIONS if use_tools else None,
+            tools=_effective_tools,
+            tool_choice=request.tool_choice if _is_agent_session else None,
         )
 
         # Track cascade costs
@@ -1654,6 +1912,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         code_stitched = False        # Set by Step 11d if code stitching succeeded
         code_repaired = False        # Set by Step 11d if code repair succeeded
         tools_used = []
+        _agent_tool_calls = None     # Set for agent sessions to pass through
         web_enrichment_ctx = ""  # Set by web enrichment if pre-search was done
         _search_depth = "snippets"   # Set by synthesis step
         _analysis_mode = "factual"   # Set by synthesis step
@@ -1665,10 +1924,147 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                  f"input_tok={llm_result['usage'].get('prompt_tokens',0)}")
 
         # ─── Step 11b: Tool Calling Loop + Escalation ─────────────────
-        if use_tools:
+        if use_tools or _is_agent_session:
             tool_calls = llm_result.get("tool_calls")
             response_content = llm_result.get("content", "").strip()
 
+            if tool_calls and _is_agent_session:
+                # ── Agent session: split tool_calls into gateway vs client tools ──
+                _gw_calls = [tc for tc in tool_calls 
+                             if tc.get("function", {}).get("name") in _gateway_tool_names]
+                _client_calls = [tc for tc in tool_calls
+                                 if tc.get("function", {}).get("name") not in _gateway_tool_names]
+                
+                if _client_calls:
+                    _agent_tool_calls = _client_calls
+                    log.info(f"[{request_id}] Agent client tool_calls (pass-through): "
+                             f"{[tc.get('function',{}).get('name','?') for tc in _client_calls]}")
+                    # Gemini sometimes duplicates tool calls as plaintext in content
+                    # e.g. content="print(default_api.memory_search(...))" + tool_calls=[memory_search]
+                    # Strip the plaintext code so OpenClaw doesn't show it to the user
+                    if response_content and any(p in response_content for p in 
+                            ["default_api.", "print(", ".memory_search(", ".web_search(",
+                             ".exec(", ".write(", ".read("]):
+                        log.info(f"[{request_id}] Stripping plaintext code from agent content: "
+                                 f"'{response_content[:100]}'")
+                        response_content = ""
+                        llm_result["content"] = ""  # Keep in sync
+                
+                if _gw_calls:
+                    # Gateway tools need server-side execution
+                    tool_calls = _gw_calls
+                    log.info(f"[{request_id}] Agent gateway tools (executing): "
+                             f"{[tc.get('function',{}).get('name','?') for tc in _gw_calls]}")
+                else:
+                    # Only client tools — skip gateway execution
+                    tool_calls = None
+                    _final_content = response_content
+                    _source_footer = ""
+                    _filtered_footer = ""
+            
+            # ── Agent forced web_search: detect hallucinated/lazy responses ──
+            # Three triggers:
+            # 1. _needs_web_search=True but model didn't call web_search
+            # 2. Model response contains citation markers ([1], [2], "Quellen:")
+            #    but no web_search was called → hallucinated sources
+            # 3. Model deflects ("konnte keine Informationen finden", "empfehle 
+            #    lokale Webseite") without actually searching → lazy deflection
+            _forced_web_search = False
+            if _is_agent_session and not tool_calls:
+                _has_web_call = False
+                if llm_result.get("tool_calls"):
+                    _has_web_call = any(
+                        tc.get("function", {}).get("name") == "web_search"
+                        for tc in llm_result["tool_calls"]
+                    )
+                _resp = response_content or ""
+                _resp_lower = _resp.lower()
+                # Detect hallucinated source patterns in response
+                import re as _re_hall
+                _has_fake_citations = bool(
+                    _re_hall.search(r'\[\d+\]', _resp)  # [1], [2], etc.
+                    and ("http" in _resp or "quellen" in _resp_lower
+                         or "quelle" in _resp_lower or "source" in _resp_lower)
+                )
+
+                # Detect lazy deflection: model says "I couldn't find anything"
+                # without ever calling web_search
+                _deflection_phrases = [
+                    "konnte keine", "keine spezifischen",
+                    "keine informationen", "keine ergebnisse",
+                    "keine veranstaltungen", "keine events",
+                    "keine daten", "nichts gefunden",
+                    "couldn't find", "no results", "no information",
+                    "could not find", "unable to find",
+                ]
+                _deflection_signals = [
+                    "empfehle", "empfehlung", "webseite", "website",
+                    "kalender", "nachrichten", "prüfen",
+                    "recommend", "check the", "visit the",
+                ]
+                _has_deflection = (
+                    any(p in _resp_lower for p in _deflection_phrases)
+                    and any(s in _resp_lower for s in _deflection_signals)
+                    and not _has_web_call
+                )
+
+                # Check if query is a short greeting/chat (not worth web searching)
+                _rq_words = _routing_query.split()
+                _question_words_check = {"was", "wie", "what", "how", "wieviel",
+                                         "welche", "which", "wann", "when", "wo",
+                                         "where", "wer", "who", "warum", "why"}
+                _is_greeting = (
+                    len(_rq_words) <= 2
+                    and not any(w.lower() in _question_words_check
+                                for w in _rq_words)
+                )
+
+                _should_force = (
+                    not _is_greeting and not _has_web_call
+                    and (_needs_web_search or _has_fake_citations or _has_deflection)
+                )
+
+                if _is_greeting and _has_fake_citations:
+                    # Short greeting with hallucinated sources → strip citations
+                    # instead of forcing a web search for "Huhu" or "Hallo"
+                    _resp = _re_hall.sub(r'\[\d+\]', '', _resp)
+                    # Strip Quellen/Sources footer
+                    _resp = _re_hall.split(
+                        r'\n+(?:Quellen|Sources|Quelle|Source)\s*:',
+                        _resp
+                    )[0].strip()
+                    response_content = _resp
+                    llm_result["content"] = _resp
+                    log.info(f"[{request_id}] Stripped hallucinated citations "
+                             f"from greeting response (query='{_routing_query}')")
+
+                elif _should_force:
+                    _trigger = ("needs_web" if _needs_web_search 
+                                else "hallucinated_citations" if _has_fake_citations
+                                else "lazy_deflection")
+                    log.warning(f"[{request_id}] Agent forced web_search "
+                                f"(trigger={_trigger}): model didn't call web_search, "
+                                f"executing for query: '{_routing_query[:80]}'")
+                    metrics.increment("agent_forced_web_search",
+                                      tags={"trigger": _trigger})
+                    # Build a synthetic web_search tool call
+                    import uuid as _uuid
+                    _forced_tc_id = f"forced_{_uuid.uuid4().hex[:8]}"
+                    tool_calls = [{
+                        "id": _forced_tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": json.dumps({
+                                "query": _routing_query,
+                                "search_depth": "medium",
+                            }),
+                        },
+                    }]
+                    _forced_web_search = True
+                    response_content = _resp
+
+            # Execute gateway tool calls (normal flow)
             if tool_calls:
                 # ── Model requested tool calls → execute free APIs ──
                 log.info(f"[{request_id}] Tool calls: "
@@ -1683,17 +2079,18 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 follow_up = []
 
                 # ── Extract analysis parameters from Round 1 ──
-                _search_depth = "snippets"
+                _search_depth = "deep"  # Minimum: tool_executor always upgrades snippets→deep
                 _analysis_mode = "factual"
                 for tc in tool_calls:
                     if tc.get("function", {}).get("name") == "web_search":
                         try:
                             _tc_args = json.loads(tc.get("function", {}).get("arguments", "{}"))
-                            _search_depth = _tc_args.get("search_depth",
-                                            _tc_args.get("depth", "snippets"))
+                            _raw_depth = _tc_args.get("search_depth",
+                                            _tc_args.get("depth", "deep"))
                             # Normalize: min/medium/max → snippets/deep/thorough
-                            _depth_map = {"min": "snippets", "medium": "deep", "max": "thorough"}
-                            _search_depth = _depth_map.get(_search_depth, _search_depth)
+                            _depth_map = {"min": "deep", "medium": "deep", "max": "thorough",
+                                          "snippets": "deep"}
+                            _search_depth = _depth_map.get(_raw_depth, "deep")
                             _analysis_mode = _tc_args.get("analysis_mode", "factual")
                         except (json.JSONDecodeError, AttributeError):
                             pass
@@ -1726,6 +2123,53 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     blueprint=_blueprint,
                     output_architecture=_output_arch or None,
                 )
+
+                # ── Agent sessions: use lighter synthesis prompt ──
+                # The full synthesis prompt (400+ lines) is designed for the test console.
+                # For agent/Telegram context, use a concise prompt with structure guidance.
+                if _is_agent_session and "web_search" in tools_used:
+                    from datetime import datetime as _dt
+                    _today = _dt.now().strftime("%d.%m.%Y")
+                    synthesis_prompt = (
+                        f"Du bist ein hilfreicher Recherche-Assistent. Heutiges Datum: {_today}.\n"
+                        "Dir wurden Suchergebnisse bereitgestellt.\n\n"
+                        "ANTWORT-FORMAT:\n"
+                        "- Beginne mit einer klaren Zusammenfassung in 1-2 Sätzen\n"
+                        "- Gliedere mit **fetten Überschriften** wo sinnvoll (2-4 Abschnitte)\n"
+                        "- Verwende konkrete Zahlen und Fakten aus den Quellen\n"
+                        "- Nenne Datumsangaben und zeitliche Einordnung wenn relevant\n"
+                        "- Schließe mit einem kurzen **Fazit** oder Einordnung ab\n"
+                        "- Liste Quellen als nummerierte Links am Ende: [1] URL — Titel\n\n"
+                        "REGELN:\n"
+                        "- SPRACHE: Antworte in der Sprache der Nutzerfrage (Deutsch → Deutsch)\n"
+                        "- Extrahiere Fakten aus den Quellen, nicht aus deinem Wissen\n"
+                        "- Bei Widersprüchen: benenne beide Positionen\n"
+                        "- Keine Code-Blöcke, keine API-Aufrufe\n"
+                        "- Halte die Antwort kompakt (Telegram-Kontext), aber informativ\n\n"
+                        "SELBST-BEWERTUNG (PFLICHT):\n"
+                        "Füge am ENDE deiner Antwort (nach den Quellen) EXAKT diesen Block ein:\n"
+                        '<!--QUALITY:{"answered":true/false,"confidence":"high"/"medium"/"low",'
+                        '"source_count":N,"has_facts":true/false,'
+                        '"retry":null oder {"queries":["..."],"time_filter":"d"/"w"/"m"/"none","reason":"..."}}\n'
+                        "-->\n"
+                        "Feld-Erklärungen:\n"
+                        "- answered: true wenn die Frage konkret beantwortet wurde\n"
+                        "- confidence: high/medium/low — Qualität der Quellenabdeckung\n"
+                        "- source_count: Anzahl genutzter Quellen\n"
+                        "- has_facts: true wenn konkrete Fakten/Zahlen/Termine extrahiert\n"
+                        "- retry: null wenn Antwort ausreichend. Sonst ein Objekt mit:\n"
+                        '  - queries: 1-3 bessere Suchbegriffe (z.B. ["Veranstaltungen Konstanz Februar 2026", "Events Bodensee"])\n'
+                        '  - time_filter: "d" (24h), "w" (Woche), "m" (Monat), "none" (unbegrenzt)\n'
+                        "  - reason: kurze Begründung warum Nachsuche sinnvoll\n"
+                        "Empfehle retry wenn: Quellen irrelevant, zu wenig konkrete Daten, "
+                        "falsche Sprache der Ergebnisse, oder Frage nur teilweise beantwortet."
+                    )
+                    # For agent sessions, use distill context (only question + search results)
+                    # instead of sending the full OpenClaw conversation history back
+                    _ctx_strategy = {"mode": "distill", "distill_text": ""}
+                    log.info(f"[{request_id}] Agent synthesis: using lightweight prompt "
+                             f"(depth={_search_depth})")
+
                 follow_up.append({"role": "system", "content": synthesis_prompt})
 
                 # ── Apply Context Strategy: full / recent:N / distill ──
@@ -1733,18 +2177,32 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 _original_msgs = len(trimmed_messages)
                 _original_tok = sum(len(m.content or "") // 4 for m in trimmed_messages)
 
-                if _ctx_mode == "distill" and _ctx_strategy.get("distill_text"):
+                if _ctx_mode == "distill":
                     # DISTILL: Replace full history with compact extract
                     last_user_msg = ""
                     for msg in reversed(trimmed_messages):
                         if msg.role == "user":
-                            last_user_msg = msg.content
+                            last_user_msg = msg.text_content or msg.content or ""
                             break
-                    compact_context = (
-                        f"Relevanter Kontext aus der Konversation:\n"
-                        f"{_ctx_strategy['distill_text']}\n\n"
-                        f"Aktuelle Frage:\n{last_user_msg}"
-                    )
+                    _distill_text = _ctx_strategy.get("distill_text", "")
+                    if _distill_text:
+                        compact_context = (
+                            f"Relevanter Kontext aus der Konversation:\n"
+                            f"{_distill_text}\n\n"
+                            f"Aktuelle Frage:\n{last_user_msg}"
+                        )
+                    else:
+                        # Agent mode: no prior context needed, just the question
+                        # Strip OpenClaw system logs if present
+                        compact_context = last_user_msg
+                        if _is_agent_session and "\n" in compact_context:
+                            import re as _re2
+                            _tg = _re2.search(
+                                r'\[Telegram [^\]]+\]\s*(.+?)(?:\s*\[message_id:\s*\d+\])?\s*$',
+                                compact_context, _re2.DOTALL
+                            )
+                            if _tg:
+                                compact_context = _tg.group(1).strip()
                     follow_up.append({"role": "user", "content": compact_context})
                     _r2_msg_count = 1
                     _r2_tok = len(compact_context) // 4
@@ -1767,13 +2225,13 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                                  f"(trimmed {trimmed_count})")
                     r2_messages = system_msgs + non_system
                     for msg in r2_messages:
-                        follow_up.append({"role": msg.role, "content": msg.content})
+                        follow_up.append(_msg_to_dict(msg))
                     _r2_msg_count = len(r2_messages)
 
                 else:
                     # FULL: Pass entire conversation history (default, safe for code)
                     for msg in trimmed_messages:
-                        follow_up.append({"role": msg.role, "content": msg.content})
+                        follow_up.append(_msg_to_dict(msg))
                     _r2_msg_count = _original_msgs
 
                 log.info(f"[{request_id}] Synthesis: depth={_search_depth} "
@@ -1903,7 +2361,59 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
             # or raw JSON blueprints (e.g. {"query": "...", "search_depth": "medium"})
             # or output_architecture JSON instead of actually calling tools.
             # Detection: no tool_calls, response looks like code/JSON, not a real answer.
-            if not tool_calls and not escalated_to and response_content:
+
+            # Agent session guard: Gemini sometimes outputs tool calls as plaintext
+            # e.g. "print(default_api.memory_search(...))" instead of proper tool_call
+            # Strip these patterns and retry
+            if _is_agent_session and not tool_calls and response_content:
+                _agent_code_patterns = [
+                    "default_api.", "print(default_api.", "print(default_api",
+                ]
+                _rc_stripped = response_content.strip()
+                if (any(p in _rc_stripped for p in _agent_code_patterns)
+                        and len(_rc_stripped) < 500):
+                    log.warning(f"[{request_id}] Agent plaintext tool call detected: "
+                                f"'{_rc_stripped[:150]}' → retrying")
+                    # Retry with explicit instruction
+                    _retry_msgs = list(trimmed_messages)
+                    _retry_msgs.append(ChatMessage(
+                        role="user",
+                        content=(
+                            "FEHLER: Du hast Code als Text ausgegeben statt ein Tool zu verwenden. "
+                            "Verwende das web_search Tool für Wissensfragen oder antworte direkt. "
+                            "Gib NIEMALS Python-Code wie print(default_api...) aus."
+                        ),
+                    ))
+                    llm_result = await _llm_call_with_retry(
+                        provider, messages=_retry_msgs, model=model,
+                        max_tokens=max_output,
+                        temperature=request.temperature or 0.7,
+                        system_prompt=system_prompt, use_cache=False,
+                        tools=_effective_tools,
+                        tool_choice=request.tool_choice if _is_agent_session else None,
+                    )
+                    cascade_costs.append(llm_result.get("cost_usd", 0))
+                    cascade_tokens.append(llm_result["usage"].get("total_tokens", 0))
+                    tool_calls = llm_result.get("tool_calls")
+                    response_content = llm_result.get("content", "").strip()
+                    # Re-check for agent tool routing
+                    if tool_calls and _is_agent_session:
+                        _gw_calls = [tc for tc in tool_calls
+                                     if tc.get("function", {}).get("name") in _gateway_tool_names]
+                        _client_calls = [tc for tc in tool_calls
+                                         if tc.get("function", {}).get("name") not in _gateway_tool_names]
+                        if _client_calls:
+                            _agent_tool_calls = _client_calls
+                        if _gw_calls:
+                            tool_calls = _gw_calls
+                        else:
+                            tool_calls = None
+                            _final_content = response_content
+                            _source_footer = ""
+                            _filtered_footer = ""
+
+            # SKIP remaining hallucination guard for agent sessions
+            if not tool_calls and not escalated_to and response_content and not _is_agent_session:
                 _hallucination_patterns = [
                     "default_api.", "print(", ".web_search(", ".memory_search(",
                     ".get_weather(", ".get_stock_price(", ".get_news(",
@@ -2072,7 +2582,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                             _ctx_strategy = extract_context_strategy(response_content) if response_content else {"mode": "full"}
 
                             for m in trimmed_messages:
-                                follow_up.append({"role": m.role, "content": m.text_content})
+                                follow_up.append(_msg_to_dict(m))
                             follow_up.append({
                                 "role": "assistant",
                                 "content": response_content or "Ich suche nach Informationen...",
@@ -2134,6 +2644,75 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                             log.warning(f"[{request_id}] Hallucination retry also "
                                         f"produced code → using original")
 
+            # ── Guard: Model refused to search and asked for clarification ──
+            # Sometimes the model says "I can search for you" or "give me more details"
+            # instead of just using the web_search tool. Auto-trigger search in this case.
+            # SKIP for agent sessions (OpenClaw) — clarification questions are normal.
+            if (not tool_calls and not escalated_to and use_tools
+                    and response_content and len(response_content) < 600
+                    and not _is_agent_session):
+                _refusal_patterns = [
+                    # German
+                    "kann ich eine", "kann eine suche", "web-suche durchführen",
+                    "websuche durchführen", "suche durchführen",
+                    "benötige ich weitere", "benötige weitere",
+                    "geben sie mir", "gib mir mehr details",
+                    "können sie mir", "kannst du mir mehr",
+                    "welche art von", "welche spezifischen",
+                    "weitere informationen benötigt", "bitte teilen sie mir",
+                    "um ihnen besser helfen", "um dir besser helfen",
+                    # English (model sometimes responds in English to German questions)
+                    "i can search", "i can perform", "could you provide more",
+                    "need more information", "need more details",
+                    "please provide more", "can you clarify",
+                    "i would need more", "could you specify",
+                    "what specific", "which specific",
+                    "to help you better", "to better assist",
+                    "i'll need to know", "i need to know more",
+                    "can you tell me more", "what kind of",
+                    "what type of", "do you have any specific",
+                    "could you elaborate", "more context would help",
+                    "i'd be happy to search", "i can look",
+                    "shall i search", "would you like me to search",
+                    "let me know if you", "let me know what",
+                ]
+                _rc_lower = response_content.lower()
+                _is_refusal = any(p in _rc_lower for p in _refusal_patterns)
+                if _is_refusal:
+                    log.warning(f"[{request_id}] Model refused to search → "
+                                f"auto-triggering web_search for '{user_query[:60]}'")
+                    metrics.increment("refused_to_search_retries")
+                    try:
+                        _ws_result = await tool_web_search(query=user_query, depth="deep")
+                        if _ws_result and len(_ws_result) > 100:
+                            _synth_prompt = build_synthesis_prompt("deep")
+                            _auto_msgs = []
+                            for m in trimmed_messages:
+                                _auto_msgs.append({"role": m.role, "content": m.text_content})
+                            _auto_msgs.append({
+                                "role": "user",
+                                "content": f"{_ws_result}\n\n{_synth_prompt}",
+                            })
+                            _auto_result = await provider.chat(
+                                messages=[ChatMessage(**m) for m in _auto_msgs],
+                                model=model,
+                                max_tokens=max_output,
+                                temperature=request.temperature or 0.7,
+                                system_prompt=system_prompt,
+                            )
+                            cascade_costs.append(_auto_result.get("cost_usd", 0))
+                            cascade_tokens.append(
+                                _auto_result["usage"].get("total_tokens", 0))
+                            _auto_text = _auto_result.get("content", "").strip()
+                            if _auto_text and len(_auto_text) > 50:
+                                llm_result = _auto_result
+                                response_content = _auto_text
+                                tools_used = ["web_search"]
+                                log.info(f"[{request_id}] Auto-search succeeded: "
+                                         f"{len(_auto_text)} chars")
+                    except Exception as e:
+                        log.warning(f"[{request_id}] Auto-search failed: {e}")
+
             if escalated_to:
                 log.info(f"[{request_id}] Cascade: cheap → {escalated_to}")
                 metrics.increment("cascade_escalations", tags={"to": escalated_to})
@@ -2173,13 +2752,11 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 esc_provider = _get_provider_for_tier(tier)
                 model = _get_model_for_tier(tier)
 
-                # Enable web search for cheap_plus (real-time data queries)
-                use_web_search = (escalated_to == "cheap_plus")
-
-                # ── Web Enrichment for medium/premium escalations ──
-                # Pre-enrich with DDG search + trafilatura for complex queries
+                # ── Web Enrichment for escalations needing current data ──
+                # Pre-enrich with DDG search + trafilatura
+                # (We do NOT use OpenRouter's $0.02 web plugin — gateway tools are free)
                 web_enrichment_ctx = ""
-                if (escalated_to in ("medium", "premium")
+                if (escalated_to in ("cheap_plus", "medium", "premium")
                         and not is_document_analysis
                         and _WEB_ENRICHMENT_AVAILABLE):
                     try:
@@ -2219,7 +2796,6 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     temperature=request.temperature or 0.7,
                     system_prompt=esc_system,
                     use_cache=(tier == "premium"),
-                    web_search=use_web_search,
                 )
                 cascade_costs.append(llm_result.get("cost_usd", 0))
                 cascade_tokens.append(llm_result["usage"].get("total_tokens", 0))
@@ -2527,8 +3103,16 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
 
         # ─── Step 11e: Post-Response Fact-Check (web verification) ────
         # For complex factual queries answered by medium/premium without
-        # prior web enrichment, verify claims against web sources
-        if (tier in ("medium", "premium")
+        # prior web enrichment, verify claims against web sources.
+        # SKIP for: agent sessions (OpenClaw manages its own flow),
+        #           API-sourced data (weather/stocks already factual),
+        #           tool-call responses (synthesis already did web search)
+        _skip_fact_check = (
+            _is_agent_session
+            or bool(tools_used)  # Already used tools (web_search, get_weather, etc.)
+        )
+        if (not _skip_fact_check
+                and tier in ("medium", "premium")
                 and not web_enrichment_ctx  # No pre-enrichment was done
                 and not is_document_analysis
                 and _WEB_ENRICHMENT_AVAILABLE
@@ -2600,10 +3184,186 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         metrics.increment("total_cost_usd", actual_cost)
 
         # Append source footer from web search (if enabled in config)
-        _final_content = llm_result["content"]
+        # Always set _final_content from synthesis result
+        _final_content = llm_result.get("content", "") or ""
+        _filtered_footer = ""
+
+        # ── Parse and strip quality self-assessment tag ──
+        _quality_assessment = None
+        if "<!--QUALITY:" in _final_content:
+            import re as _re_q
+            # Match <!--QUALITY:{...}--> with nested braces (retry object)
+            _q_match = _re_q.search(
+                r'<!--QUALITY:\s*(\{.+?\})\s*-->', _final_content, _re_q.DOTALL
+            )
+            if _q_match:
+                _q_raw = _q_match.group(1)
+                # Handle nested JSON: find balanced braces
+                _depth = 0
+                _end = 0
+                for _ci, _ch in enumerate(_q_raw):
+                    if _ch == '{': _depth += 1
+                    elif _ch == '}': _depth -= 1
+                    if _depth == 0:
+                        _end = _ci + 1
+                        break
+                _q_json = _q_raw[:_end] if _end > 0 else _q_raw
+                try:
+                    _quality_assessment = json.loads(_q_json)
+                    log.info(f"[{request_id}] Quality assessment: {_quality_assessment}")
+                except (json.JSONDecodeError, TypeError):
+                    log.warning(f"[{request_id}] Failed to parse quality tag: "
+                                f"{_q_json[:150]}")
+                # Strip the quality tag from user-visible content
+                _final_content = _final_content[:_q_match.start()].rstrip()
+                # Also strip any remaining quality tags
+                _final_content = _re_q.sub(
+                    r'<!--QUALITY:.*?-->', '', _final_content, flags=_re_q.DOTALL
+                ).rstrip()
+
+        # Log quality warnings for monitoring
+        if _quality_assessment:
+            _qa = _quality_assessment
+            if not _qa.get("answered", True):
+                log.warning(f"[{request_id}] Quality: NOT ANSWERED "
+                            f"(confidence={_qa.get('confidence','?')}, "
+                            f"sources={_qa.get('source_count',0)})")
+            elif _qa.get("confidence") == "low":
+                log.warning(f"[{request_id}] Quality: LOW CONFIDENCE "
+                            f"(sources={_qa.get('source_count',0)}, "
+                            f"has_facts={_qa.get('has_facts', False)})")
+
+            # ── Quality-based retry: synthesis recommends follow-up search ──
+            _retry = _qa.get("retry")
+            if (_retry and isinstance(_retry, dict)
+                    and _retry.get("queries")
+                    and not getattr(main, '_quality_retry_done', False)):
+                _retry_queries = _retry["queries"][:3]
+                _retry_tf = _retry.get("time_filter", "w")
+                _retry_reason = _retry.get("reason", "low quality")
+                log.info(f"[{request_id}] Quality retry recommended: "
+                         f"queries={_retry_queries} tf={_retry_tf} "
+                         f"reason='{_retry_reason}'")
+
+                try:
+                    # Execute follow-up web search with recommended queries
+                    import uuid as _uuid_r
+                    _retry_tc_id = f"retry_{_uuid_r.uuid4().hex[:8]}"
+                    _retry_tool_calls = [{
+                        "id": _retry_tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": json.dumps({
+                                "query": _retry_queries[0],
+                                "search_depth": "medium",
+                                "time_filter": _retry_tf,
+                                "additional_queries": _retry_queries[1:] if len(_retry_queries) > 1 else None,
+                            }),
+                        },
+                    }]
+                    _retry_results = await execute_tool_calls(_retry_tool_calls)
+                    _retry_tool_text = _retry_results[0]["result"] if _retry_results else ""
+
+                    if _retry_tool_text and len(_retry_tool_text) > 200:
+                        # Re-synthesize with original + retry results
+                        from datetime import datetime as _dt_r
+                        _today_r = _dt_r.now().strftime("%d.%m.%Y")
+                        _retry_synthesis_prompt = (
+                            f"Du bist ein Recherche-Assistent. Heutiges Datum: {_today_r}.\n"
+                            "Dir wurden die Ergebnisse einer NACHSUCHE bereitgestellt.\n"
+                            "Du hast bereits eine erste Antwort gegeben (siehe unten), "
+                            "aber die Quellen waren unzureichend.\n\n"
+                            "Erstelle eine VERBESSERTE Antwort die die neuen Quellen einbezieht.\n"
+                            "Behalte die Struktur bei: Überschriften, Fazit, [N] Quellen.\n"
+                            "SPRACHE: Antworte in der Sprache der Nutzerfrage.\n"
+                            "Halte die Antwort kompakt (Telegram-Kontext).\n\n"
+                            "SELBST-BEWERTUNG: Füge am Ende ein:\n"
+                            '<!--QUALITY:{"answered":true/false,"confidence":"high"/"medium"/"low",'
+                            '"source_count":N,"has_facts":true/false,"retry":null}-->'
+                        )
+                        _retry_follow_up = [
+                            {"role": "system", "content": _retry_synthesis_prompt},
+                            {"role": "user", "content": (
+                                f"Ursprüngliche Frage: {_routing_query}\n\n"
+                                f"Erste Antwort (unzureichend):\n{_final_content}\n\n"
+                                f"Neue Suchergebnisse:\n{_retry_tool_text}"
+                            )},
+                        ]
+                        await asyncio.sleep(0.5)
+                        _retry_llm = await provider.chat(
+                            messages=[],
+                            model=model,
+                            max_tokens=max_output,
+                            temperature=0.7,
+                            raw_messages=_retry_follow_up,
+                        )
+                        cascade_costs.append(_retry_llm.get("cost_usd", 0))
+                        cascade_tokens.append(
+                            _retry_llm["usage"].get("total_tokens", 0))
+
+                        _retry_content = _retry_llm.get("content", "") or ""
+                        # Parse quality tag from retry
+                        import re as _re_qr
+                        _qr_match = _re_qr.search(
+                            r'<!--QUALITY:\s*(\{.+?\})\s*-->',
+                            _retry_content, _re_qr.DOTALL
+                        )
+                        _retry_quality = None
+                        if _qr_match:
+                            _qr_raw = _qr_match.group(1)
+                            _d = 0
+                            _e = 0
+                            for _j, _c in enumerate(_qr_raw):
+                                if _c == '{': _d += 1
+                                elif _c == '}': _d -= 1
+                                if _d == 0: _e = _j + 1; break
+                            try:
+                                _retry_quality = json.loads(
+                                    _qr_raw[:_e] if _e > 0 else _qr_raw)
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                            _retry_content = _retry_content[:_qr_match.start()].rstrip()
+                            _retry_content = _re_qr.sub(
+                                r'<!--QUALITY:.*?-->', '',
+                                _retry_content, flags=_re_qr.DOTALL
+                            ).rstrip()
+
+                        # Use retry result if it's better
+                        _retry_better = (
+                            _retry_quality
+                            and _retry_quality.get("answered", False)
+                            and _retry_quality.get("confidence", "low") != "low"
+                        )
+                        if _retry_better or len(_retry_content) > len(_final_content) * 1.3:
+                            _final_content = _retry_content
+                            _quality_assessment = _retry_quality or _quality_assessment
+                            # Update source footer
+                            _source_footer_retry = get_last_source_footer()
+                            if _source_footer_retry:
+                                from tool_executor import get_last_source_footer as _glsf2
+                                clear_source_footer()
+                            log.info(f"[{request_id}] Quality retry SUCCESS: "
+                                     f"used improved answer "
+                                     f"(quality={_retry_quality})")
+                        else:
+                            log.info(f"[{request_id}] Quality retry: kept original "
+                                     f"(retry not better, quality={_retry_quality})")
+
+                    actual_cost = sum(cascade_costs)
+                    actual_tokens = sum(cascade_tokens)
+                except Exception as _retry_err:
+                    log.warning(f"[{request_id}] Quality retry failed: {_retry_err}")
         try:
             _source_footer = get_last_source_footer()
-            if _source_footer and tools_used and "web_search" in tools_used:
+            _has_web_tools = tools_used and ("web_search" in tools_used or "get_news" in tools_used)
+            
+            if _source_footer:
+                log.info(f"[{request_id}] Source footer available: "
+                         f"{len(_source_footer)} chars, {_source_footer.count('[')} refs | "
+                         f"tools_used={tools_used} | agent_tc={bool(_agent_tool_calls)}")
+            
+            if _source_footer and _has_web_tools:
                 import re as _re
                 
                 # Post-process: remove inline URL citations the model shouldn't have used
@@ -2674,16 +3434,16 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         except Exception:
             pass  # Source footer is optional, never fail on it
 
-        # Store in caches (skip if no_cache mode)
+        # Store in caches (skip if no_cache mode or agent session)
         response_data = {"content": _final_content}
 
-        if config.cache.exact_cache_enabled and not no_cache:
+        if config.cache.exact_cache_enabled and not no_cache and not _is_agent_session:
             exact_cache.set(
                 user_query, fingerprint, response_data,
                 response_type, model
             )
 
-        if config.cache.semantic_cache_enabled and not no_cache and tier in ("cheap", "cheap_plus", "medium", "premium"):
+        if config.cache.semantic_cache_enabled and not no_cache and not _is_agent_session and tier in ("cheap", "cheap_plus", "medium", "premium"):
             embedding_fn = None
             if "embedding" in providers:
                 embedding_fn = providers["embedding"].get_embedding
@@ -2710,6 +3470,97 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                  f"{' | web_enriched' if web_enrichment_ctx else ''}"
                  f"{' | media:' + ','.join(media_types) if has_media else ''}")
 
+        # ── Debug buffer capture ──
+        try:
+            _debug_entry = {
+                "id": request_id,
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "query": user_query[:300],
+                "tier": tier,
+                "model": model,
+                "cost_usd": actual_cost,
+                "latency_ms": round(latency, 1),
+                "tokens": {"in": llm_result["usage"]["prompt_tokens"],
+                           "out": llm_result["usage"]["completion_tokens"],
+                           "reasoning": llm_result["usage"].get("reasoning_tokens", 0)},
+                "escalated": escalated_to,
+                "tools_used": tools_used,
+                "is_agent": _is_agent_session,
+                "system_prompt": (system_prompt or "")[:3000],
+                "messages": [
+                    {"role": m.role,
+                     "content": (m.text_content or "")[:800],
+                     "has_tc": bool(getattr(m, 'tool_calls', None)),
+                     "tc_names": [tc.get("function", {}).get("name", "?")
+                                  for tc in (getattr(m, 'tool_calls', None) or [])],
+                     "has_tid": bool(getattr(m, 'tool_call_id', None))}
+                    for m in (trimmed_messages or [])
+                ],
+                "response": (_final_content or "")[:3000],
+                "response_tool_calls": (
+                    [tc.get("function", {}).get("name", "?")
+                     for tc in (_agent_tool_calls or llm_result.get("tool_calls") or [])]
+                    if (_agent_tool_calls or llm_result.get("tool_calls")) else None
+                ),
+                "routing": {
+                    "action": (enhanced_result.action.value if enhanced_result
+                              else route_result.action.value if route_result else None),
+                    "response_type": (enhanced_result.response_type if enhanced_result
+                                     else route_result.response_type if route_result
+                                     else response_type),
+                    "is_code": (enhanced_result.is_code_generation if enhanced_result
+                               else route_result.is_code_generation if route_result
+                               and hasattr(route_result, 'is_code_generation') else False),
+                    "needs_web": _needs_web_search if cascade_mode else None,
+                },
+                "web_enrichment": web_enrichment_ctx[:200] if web_enrichment_ctx else None,
+                "quality": _quality_assessment,
+            }
+            _debug_buffer.append(_debug_entry)
+        except Exception as _de:
+            log.debug(f"[{request_id}] Debug capture failed: {_de}")
+
+        # ── Agent pass-through: return tool_calls directly to client ──
+        if _agent_tool_calls:
+            from starlette.responses import JSONResponse as _JSONResponse
+            _agent_msg = {"role": "assistant", "content": _final_content or None}
+            _agent_msg["tool_calls"] = _agent_tool_calls
+            
+            if request.stream:
+                import json as _json
+                _created = int(time.time())
+                
+                async def _agent_stream():
+                    if _final_content:
+                        yield f"data: {_json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': _created, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': _final_content}, 'finish_reason': None}]})}\n\n"
+                    yield f"data: {_json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': _created, 'model': model, 'choices': [{'index': 0, 'delta': {'tool_calls': _agent_tool_calls}, 'finish_reason': 'tool_calls'}]})}\n\n"
+                    yield "data: [DONE]\n\n"
+                
+                from starlette.responses import StreamingResponse as _StreamResp
+                log.info(f"[{request_id}] Agent pass-through stream with "
+                         f"{len(_agent_tool_calls)} tool_calls")
+                return _StreamResp(_agent_stream(), media_type="text/event-stream")
+            
+            _agent_response = {
+                "id": request_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": _agent_msg,
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {
+                    "prompt_tokens": llm_result["usage"]["prompt_tokens"],
+                    "completion_tokens": llm_result["usage"]["completion_tokens"],
+                    "total_tokens": actual_tokens,
+                },
+            }
+            log.info(f"[{request_id}] Agent pass-through response with "
+                     f"{len(_agent_tool_calls)} tool_calls")
+            return _JSONResponse(content=_agent_response)
+
         return _build_response(
             request_id, response_data, model,
             {
@@ -2733,6 +3584,18 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 "web_enrichment": web_enrichment_ctx[:50] + "..." if web_enrichment_ctx else None,
                 "synthesis_mode": f"{_search_depth}/{_analysis_mode}/ctx={_ctx_mode}" if tools_used and "web_search" in tools_used else None,
                 "request_tokens": total_request_tokens,
+                # Routing classification info (for test console debugging)
+                "routing": {
+                    "action": (enhanced_result.action.value if enhanced_result
+                              else route_result.action.value if route_result else None),
+                    "response_type": (enhanced_result.response_type if enhanced_result
+                                     else route_result.response_type if route_result else response_type),
+                    "is_code": (enhanced_result.is_code_generation if enhanced_result
+                               else route_result.is_code_generation if route_result
+                               and hasattr(route_result, 'is_code_generation') else False),
+                    "layer": (enhanced_result.routing_layer if enhanced_result
+                              else "cascade" if not route_result else "intent_router"),
+                },
                 # v2: Enhanced routing info
                 "enhanced_routing": {
                     "layer": enhanced_result.routing_layer if enhanced_result else None,
@@ -2749,6 +3612,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 total_tokens=actual_tokens,
                 cache_read_tokens=llm_result["usage"].get("cache_read_tokens", 0),
                 cache_write_tokens=llm_result["usage"].get("cache_write_tokens", 0),
+                reasoning_tokens=llm_result["usage"].get("reasoning_tokens", 0),
                 estimated_cost_usd=actual_cost,
             ),
             stream=request.stream,
@@ -2784,6 +3648,11 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
             raise HTTPException(status_code=status,
                                 detail=f"Provider temporarily unavailable ({status}). Please retry.",
                                 headers={"Retry-After": "10"})
+        if status == 500:
+            # Provider internal error — often transient, suggest retry
+            raise HTTPException(502,
+                                f"Provider returned error 500 (transient). Please retry.",
+                                headers={"Retry-After": "5"})
         raise HTTPException(502, f"Provider returned error {status}")
     except httpx.ConnectError as e:
         metrics.increment("errors")
@@ -2895,8 +3764,8 @@ def _estimate_request_cost(tier: str, tokens: int) -> float:
     prices = {
         "local": 0,
         "cheap": 0.10 / 1_000_000,
-        "cheap_plus": 0.25 / 1_000_000,  # Gemini 3 Flash ($0.10/$0.40/M) + ~$0.02 web search
-        "medium": 2.0 / 1_000_000,
+        "cheap_plus": 0.15 / 1_000_000,  # Gemini 2 Flash ($0.10/$0.40/M) + web search overhead
+        "medium": 1.0 / 1_000_000,  # Gemini 3 Flash ($0.50/$3.00/M blended)
         "premium": 9.0 / 1_000_000,  # Blended input+output
     }
     return tokens * prices.get(tier, 0)
@@ -2911,7 +3780,7 @@ def _build_response(request_id: str, response_data: dict, model: str,
     if stream:
         return _to_sse_stream(request_id, content, model, metadata, usage)
 
-    return ChatResponse(
+    response = ChatResponse(
         id=request_id,
         created=int(time.time()),
         model=model,
@@ -2923,6 +3792,10 @@ def _build_response(request_id: str, response_data: dict, model: str,
         usage=usage or UsageInfo(),
         gateway_metadata=metadata,
     )
+    # Use exclude_none to avoid sending tool_calls=null, tool_call_id=null etc.
+    # which breaks OpenAI-compatible clients (OpenClaw)
+    from starlette.responses import JSONResponse as _JSONResp
+    return _JSONResp(content=response.model_dump(exclude_none=True))
 
 
 def _to_sse_stream(request_id: str, content: str, model: str,
@@ -3064,6 +3937,26 @@ async def chat_console():
     <p>Place chat.html in templates/ directory.</p>
     </body></html>
     """, status_code=404)
+
+
+# ─── Debug View ──────────────────────────────────────────────────────────────
+
+@app.get("/debug", response_class=HTMLResponse)
+async def debug_console(request: Request):
+    """Debug view — requires ?key= query param matching GATEWAY_SECRET."""
+    key = request.query_params.get("key", "")
+    if not key or not validate_api_key(key, gateway_secret):
+        return HTMLResponse(content="<h1>401 — Add ?key=YOUR_GATEWAY_KEY</h1>", status_code=401)
+    debug_path = Path(__file__).parent / "templates" / "debug.html"
+    if debug_path.exists():
+        return HTMLResponse(content=debug_path.read_text())
+    return HTMLResponse(content="<h1>debug.html not found</h1>", status_code=404)
+
+
+@app.get("/debug/data")
+async def debug_data(auth: bool = Depends(verify_auth)):
+    """Return debug buffer as JSON (newest first)."""
+    return list(reversed(_debug_buffer))
 
 
 # ─── File Extraction Endpoint ─────────────────────────────────────────────────

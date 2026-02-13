@@ -41,8 +41,13 @@ PREMIUM - Complex code generation, large patches, architecture, project-specific
 Note: Queries may be in any language. Greetings and small talk in any language are CHEAP.
 Keywords like "aktuell", "currently", "today", "live", "jetzt", "weather", "Wetter", "Kurs", "stock" → CHEAP_PLUS.
 
+is_code_generation: Set to true when the user asks to CREATE, GENERATE, WRITE, BUILD, or MODIFY code, 
+  a website, HTML, CSS, JavaScript, a script, a program, an app, a component, or any software artifact.
+  This includes requests in ANY language (German: "erstelle", "generiere", "programmiere", "baue";
+  French: "créez", "générez"; etc.). Set to false for questions ABOUT code, explanations, or non-code tasks.
+
 Reply ONLY with JSON:
-{"action": "...", "confidence": 0.0-1.0, "response_type": "...", "reason": "..."}
+{"action": "...", "confidence": 0.0-1.0, "response_type": "...", "is_code_generation": true/false, "reason": "..."}
 
 response_type must be one of:
 - explanation_generic
@@ -154,10 +159,11 @@ class IntentRouter:
             metrics.increment("router_cost_usd", router_cost)
 
             return RouterResult(
-                action=RouterAction(parsed.get("action", "cheap")),
+                action=RouterAction(parsed.get("action", "cheap").lower()),
                 confidence=float(parsed.get("confidence", 0.8)),
                 response_type=parsed.get("response_type", "explanation_generic"),
                 reason=parsed.get("reason", f"{self.router_provider}_classified"),
+                is_code_generation=bool(parsed.get("is_code_generation", False)),
             )
 
     def _heuristic_classify(self, query: str) -> RouterResult:
@@ -244,7 +250,32 @@ class IntentRouter:
                     confidence=0.85,
                     response_type="code_suggestion",
                     reason=f"heuristic_premium:{pattern}",
+                    is_code_generation=True,
                 )
+
+        # Code generation indicators (multilingual)
+        # Technology keywords that strongly signal code creation regardless of language
+        _code_tech = ["html", "css", "javascript", "python", "react", "vue",
+                      "typescript", "json", "yaml", "sql", "api", "rest",
+                      "webseite", "website", "webpage", "app", "script",
+                      "component", "funktion", "function", "klasse", "class"]
+        _code_verbs = ["schreib", "erstell", "generier", "programmier", "bau",
+                       "entwickl", "mach", "erzeug", "implementier",
+                       "write", "create", "generate", "build", "make",
+                       "code", "develop", "implement",
+                       "créez", "générez", "écrivez",  # French
+                       "crea", "genera", "scrivi",     # Italian/Spanish
+                       ]
+        _has_tech = any(t in q for t in _code_tech)
+        _has_verb = any(v in q for v in _code_verbs)
+        if _has_tech and _has_verb:
+            return RouterResult(
+                action=RouterAction.MEDIUM,
+                confidence=0.85,
+                response_type="code_suggestion",
+                reason=f"heuristic_code_gen",
+                is_code_generation=True,
+            )
 
         # Medium indicators (moderate code + explanations)
         medium_patterns = [
@@ -260,11 +291,13 @@ class IntentRouter:
         ]
         for pattern in medium_patterns:
             if pattern in q:
+                _is_explanation = "explain" in pattern or "what" in pattern or "how" in pattern or "why" in pattern
                 return RouterResult(
                     action=RouterAction.MEDIUM,
                     confidence=0.75,
-                    response_type="explanation_generic" if "explain" in pattern or "what" in pattern or "how" in pattern or "why" in pattern else "code_suggestion",
+                    response_type="explanation_generic" if _is_explanation else "code_suggestion",
                     reason=f"heuristic_medium:{pattern}",
+                    is_code_generation=not _is_explanation,
                 )
 
         # Cheap: simple lookups

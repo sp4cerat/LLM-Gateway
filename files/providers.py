@@ -45,6 +45,9 @@ def _check_response(response: httpx.Response, provider: str, model: str):
                                      response.text[:200])
     if response.status_code in (503, 529):
         raise ProviderOverloadError(provider, model, response.text[:200])
+    if response.status_code >= 400:
+        log.error(f"Provider {provider}/{model} HTTP {response.status_code}: "
+                  f"{response.text[:500]}")
     response.raise_for_status()
 
 
@@ -483,7 +486,7 @@ class OpenRouterProvider(LLMProvider):
         "meta-llama/llama-3.3-70b-instruct": {"input": 0.30, "output": 0.40},
         # Google
         "google/gemini-2.0-flash-001": {"input": 0.10, "output": 0.40},
-        "google/gemini-3-flash-preview": {"input": 0.10, "output": 0.40},
+        "google/gemini-3-flash-preview": {"input": 0.50, "output": 3.00},
         "google/gemini-2.5-pro-preview": {"input": 1.25, "output": 10.0},
         # OpenAI
         "openai/gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -508,10 +511,12 @@ class OpenRouterProvider(LLMProvider):
                    system_prompt: str = "", use_cache: bool = False,
                    web_search: bool = False,
                    tools: list[dict] = None,
+                   tool_choice=None,
                    raw_messages: list[dict] = None) -> dict:
         """
         Chat with OpenRouter. Supports:
           - tools: OpenAI function calling format (list of tool definitions)
+          - tool_choice: Tool choice strategy (auto, none, required, or specific)
           - raw_messages: Pre-formatted OpenAI messages (for tool result follow-ups)
           - web_search: OpenRouter :online plugin for paid web search
         """
@@ -525,7 +530,19 @@ class OpenRouterProvider(LLMProvider):
             if system_prompt:
                 openai_messages.append({"role": "system", "content": system_prompt})
             for msg in messages:
-                openai_messages.append({"role": msg.role, "content": _normalize_content(msg.content)})
+                content = _normalize_content(msg.content)
+                # Gemini doesn't handle null content well — use empty string
+                if content is None:
+                    content = ""
+                oai_msg = {"role": msg.role, "content": content}
+                # Preserve tool-calling fields for agent sessions
+                if msg.tool_calls:
+                    oai_msg["tool_calls"] = msg.tool_calls
+                if msg.tool_call_id:
+                    oai_msg["tool_call_id"] = msg.tool_call_id
+                if msg.name:
+                    oai_msg["name"] = msg.name
+                openai_messages.append(oai_msg)
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -546,12 +563,12 @@ class OpenRouterProvider(LLMProvider):
         # Function calling: pass tool definitions
         if tools:
             request_body["tools"] = tools
-            request_body["tool_choice"] = "auto"
+            request_body["tool_choice"] = tool_choice or "auto"
 
-        # Enable web search via OpenRouter :online plugin
-        # This gives any model real-time data (weather, stocks, news)
-        if web_search:
-            request_body["plugins"] = [{"id": "web", "max_results": 5}]
+        # NOTE: OpenRouter :online plugin ($0.02/request) is DISABLED.
+        # We use the gateway's own web_search tool (DDG + Trafilatura, free) instead.
+        # if web_search:
+        #     request_body["plugins"] = [{"id": "web", "max_results": 5}]
 
         # Retry with exponential backoff for 429/503
         max_retries = 3
@@ -586,11 +603,19 @@ class OpenRouterProvider(LLMProvider):
         input_tokens = usage.get("prompt_tokens", 0)
         output_tokens = usage.get("completion_tokens", 0)
 
-        # Calculate cost from our pricing table or use OpenRouter's reported cost
-        cost = self._calculate_cost(model, input_tokens, output_tokens)
-        # Add web search cost (~$0.02 per request with 5 results via Exa)
-        if web_search:
-            cost += 0.02
+        # Use OpenRouter's reported cost if available (more accurate than our table)
+        # OpenRouter returns total_cost in their usage object
+        our_cost = self._calculate_cost(model, input_tokens, output_tokens)
+        or_cost = usage.get("total_cost") or usage.get("cost")
+        if or_cost is not None:
+            cost = float(or_cost)
+            # Log discrepancy for pricing table maintenance
+            if abs(cost - our_cost) > 0.0001:
+                log.info(f"OpenRouter cost discrepancy for {model}: "
+                         f"OR=${cost:.6f} vs ours=${our_cost:.6f} "
+                         f"({input_tokens}+{output_tokens} tok)")
+        else:
+            cost = our_cost
 
         content = ""
         tool_calls = None
@@ -611,8 +636,15 @@ class OpenRouterProvider(LLMProvider):
                 "prompt_tokens": input_tokens,
                 "completion_tokens": output_tokens,
                 "total_tokens": input_tokens + output_tokens,
-                "cache_read_tokens": 0,
+                "cache_read_tokens": usage.get("cache_read_tokens", 0)
+                                     or usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
                 "cache_write_tokens": 0,
+                # OpenRouter-specific: reasoning/thinking tokens (Gemini 3, o1, etc.)
+                "reasoning_tokens": usage.get("reasoning_tokens", 0)
+                                    or usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0),
+                # Native tokens (before OpenRouter normalization)
+                "native_prompt_tokens": usage.get("native_tokens", {}).get("prompt_tokens", 0),
+                "native_completion_tokens": usage.get("native_tokens", {}).get("completion_tokens", 0),
             },
             "cost_usd": cost,
             "latency_ms": latency,
