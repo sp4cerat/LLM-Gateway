@@ -66,6 +66,7 @@ class ContextBudget:
     LIMITS = {
         "local":      {"input": 4000,   "output": 2000},
         "cheap":      {"input": 4000,   "output": 2000},
+        "cheap_plus": {"input": 8000,   "output": 8000},  # web search synthesis needs output room
         "cheap_long": {"input": 100000, "output": 4000},  # Doc QA on Gemini Flash (1M context)
         "medium":     {"input": 8000,   "output": 4000},
         "premium":    {"input": 16000,  "output": 8000},
@@ -201,7 +202,8 @@ class OutputStrategy:
         }
 
     def _get_output_limit(self, tier: str) -> int:
-        limits = {"local": 2000, "cheap": 2000, "medium": 4000, "premium": 8000}
+        limits = {"local": 2000, "cheap": 2000, "cheap_plus": 8000,
+                  "medium": 4000, "premium": 8000}
         return limits.get(tier, 4000)
 
 

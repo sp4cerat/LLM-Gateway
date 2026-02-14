@@ -42,6 +42,7 @@ class EnhancedRouterResult:
     routing_layer: str = "unknown"  # deterministic, heuristic, utility, llm
     utility_score: float = 0.0
     is_code_generation: bool = False
+    needs_web: bool = False
 
     def to_router_result(self) -> RouterResult:
         """Convert to standard RouterResult for backward compatibility."""
@@ -51,6 +52,7 @@ class EnhancedRouterResult:
             response_type=self.response_type,
             reason=f"{self.routing_layer}:{self.reason}",
             is_code_generation=self.is_code_generation,
+            needs_web=self.needs_web,
         )
 
 
@@ -284,6 +286,7 @@ class EnhancedRouter:
                     utility_score=utility,
                     strategy=self._pick_strategy(llm_result.action, ctx, context_map),
                     is_code_generation=llm_result.is_code_generation,
+                    needs_web=llm_result.needs_web,
                 )
                 self._log_decision(result, start)
                 return result
@@ -297,14 +300,18 @@ class EnhancedRouter:
         # Don't override tier — only set is_code_generation flag.
         # Groq calls are ~free (<0.001ct) and ~50ms.
         _llm_code_flag = False
+        _llm_needs_web = False
         if utility <= 0.25 and self.llm_router and tier in (
             RouterAction.CHEAP, RouterAction.LOCAL
         ):
             try:
                 llm_result = await self.llm_router.route(query)
                 _llm_code_flag = llm_result.is_code_generation
+                _llm_needs_web = llm_result.needs_web
                 if _llm_code_flag:
                     log.info(f"EnhancedRouter: LLM detected code_generation for low-utility query")
+                if _llm_needs_web:
+                    log.info(f"EnhancedRouter: LLM detected needs_web for low-utility query")
             except Exception:
                 pass  # Non-critical, fall through
 
@@ -319,6 +326,7 @@ class EnhancedRouter:
             strategy=self._pick_strategy(tier, ctx, context_map),
             needed_chunks=self._select_relevant_chunks(query, context_map),
             is_code_generation=_llm_code_flag,
+            needs_web=_llm_needs_web,
         )
         self._log_decision(result, start)
         return result

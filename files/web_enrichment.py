@@ -51,8 +51,9 @@ log = logging.getLogger("gateway.web_enrichment")
 MAX_FULL_TEXT_PAGES = 8
 MAX_PAGE_CHARS = 12000       # Default; overridden by config.web_search.max_page_chars
 PAGE_FETCH_TIMEOUT = 8.0     # Default; overridden by config.web_search.page_fetch_timeout
-DDG_MAX_RESULTS = 5
+DDG_MAX_RESULTS = 8
 FACT_CHECK_MIN_QUERY_LEN = 50
+MAX_CONCURRENT_DOWNLOADS = 3  # Limit parallel httpx connections (prevents C-level crashes)
 
 
 def _get_page_limits() -> tuple[int, float]:
@@ -672,6 +673,8 @@ async def fetch_full_text(url: str, use_playwright: bool = False) -> Optional[st
 async def fetch_pages(results: list[SearchResult], max_pages: int = MAX_FULL_TEXT_PAGES) -> int:
     """Fetch full text for top N results in parallel. Returns count fetched.
     
+    Uses a semaphore to limit concurrent downloads (prevents C-level crashes
+    from too many simultaneous httpx/SSL connections).
     If Playwright is available, retries pages that got <300 chars with JS rendering.
     """
     to_fetch = [
@@ -683,7 +686,13 @@ async def fetch_pages(results: list[SearchResult], max_pages: int = MAX_FULL_TEX
         return 0
 
     start = time.time()
-    tasks = [fetch_full_text(r.url) for r in to_fetch]
+    sem = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+    async def _fetch_with_sem(url: str) -> Optional[str]:
+        async with sem:
+            return await fetch_full_text(url)
+
+    tasks = [_fetch_with_sem(r.url) for r in to_fetch]
     texts = await asyncio.gather(*tasks, return_exceptions=True)
 
     fetched = 0
@@ -789,18 +798,22 @@ def build_context(
                 f"[WEBRECHERCHE — {ts}]\n"
                 f"Frage: {query}\n\n"
                 "Nutze die folgenden Quellen für eine fundierte Antwort.\n"
-                "WICHTIG: Extrahiere KONKRETE Informationen (Events, Termine, Preise, Namen).\n"
-                "Verweise den Nutzer NIEMALS auf Webseiten — liefere die Inhalte SELBST.\n"
-                "Quellenangaben als Nummern: [1], [2], [3]\n"
+                "WICHTIG:\n"
+                "- Extrahiere KONKRETE Informationen (Namen, Adressen, Telefon, Preise, Termine).\n"
+                "- KOMBINIERE Daten aus verschiedenen Quellen zum selben Eintrag.\n"
+                "- Verweise den Nutzer NIEMALS auf Webseiten — liefere die Inhalte SELBST.\n"
+                "- Quellenangaben als Nummern: [1], [2], [3]\n"
             )
         else:
             parts.append(
                 f"[WEB RESEARCH — {ts}]\n"
                 f"Question: {query}\n\n"
                 "Use these sources for a well-founded answer.\n"
-                "IMPORTANT: Extract CONCRETE information (events, dates, prices, names).\n"
-                "NEVER refer the user to websites — provide the content YOURSELF.\n"
-                "Cite sources as numbers: [1], [2], [3]\n"
+                "IMPORTANT:\n"
+                "- Extract CONCRETE information (names, addresses, phone, prices, dates).\n"
+                "- MERGE data from different sources about the same entity.\n"
+                "- NEVER refer the user to websites — provide the content YOURSELF.\n"
+                "- Cite sources as numbers: [1], [2], [3]\n"
             )
     else:  # snippets
         parts.append(
@@ -812,7 +825,7 @@ def build_context(
         )
 
     # Filter, sort by quality, and cap sources (shared with build_source_footer)
-    filtered_results = prepare_sources(results, depth)
+    filtered_results = prepare_sources(results, depth, query=query)
     
     # Tell model exactly how many sources it has
     _n_sources = len(filtered_results)
@@ -884,9 +897,11 @@ def build_context(
     return "\n".join(parts)
 
 
-def filter_irrelevant_results(results: list[SearchResult]) -> list[SearchResult]:
+def filter_irrelevant_results(results: list[SearchResult],
+                              query: str = "") -> list[SearchResult]:
     """Filter out obviously irrelevant search results (wrong language domains, spam, etc.).
     
+    If query is provided, also filters results with low topical relevance.
     This function MUST be used by both build_context() and build_source_footer()
     to ensure consistent numbering between the LLM context and the source footer.
     """
@@ -897,6 +912,33 @@ def filter_irrelevant_results(results: list[SearchResult]) -> list[SearchResult]
         "hltv.org", "mail.ru", "tv.mail.ru", "kinodraiv.pro",
         "o-politico.ru", "pndexam.ru",
     }
+    # Low-quality content domains (lifestyle blogs, generic listicles)
+    _LOW_QUALITY_DOMAINS = {
+        "pinterest.com", "pinterest.de", "instagram.com",
+        "facebook.com", "twitter.com", "x.com",
+        "tiktok.com", "youtube.com",  # video platforms (no text)
+    }
+    
+    # Extract significant query terms for relevance check
+    _query_terms = set()
+    if query:
+        import re as _re_fir
+        # Include 3+ char words (catches DNA, RNA, UV, etc.)
+        _words = _re_fir.findall(r'\b\w{3,}\b', query.lower())
+        # Remove common stop words (language-agnostic: very common function words)
+        _stop = {"welche", "welcher", "welchem", "dinge", "sachen",
+                 "things", "which", "what", "does", "have", "some",
+                 "eine", "einem", "einen", "einer", "eines",
+                 "the", "that", "this", "with", "from", "into",
+                 "nicht", "noch", "auch", "oder", "aber", "wenn",
+                 "wie", "was", "wer", "warum", "wann", "wohin",
+                 "gibt", "sind", "werden", "kann", "hat", "ist",
+                 "wird", "sein", "war", "were", "been", "being",
+                 "die", "der", "das", "des", "dem", "den",
+                 "und", "für", "von", "bei", "aus", "auf",
+                 "mit", "zum", "zur", "ins", "ans", "ums",
+                 "and", "for", "the", "are", "can", "how"}
+        _query_terms = {w for w in _words if w not in _stop}
     
     filtered = []
     seen_urls = set()
@@ -912,8 +954,23 @@ def filter_irrelevant_results(results: list[SearchResult]) -> list[SearchResult]
             tld = "." + domain.rsplit(".", 1)[-1] if "." in domain else ""
             if tld in _IRRELEVANT_TLDS or domain in _IRRELEVANT_DOMAINS:
                 continue
+            if domain in _LOW_QUALITY_DOMAINS:
+                log.debug(f"Relevance filter: skip low-quality domain {domain}")
+                continue
         except Exception:
             pass
+        
+        # Relevance check: do key query terms appear in title+snippet?
+        if _query_terms and len(_query_terms) >= 2:
+            _source_text = f"{r.title} {r.snippet}".lower()
+            _matched = sum(1 for t in _query_terms if t in _source_text)
+            # Need at least 2 term matches, or 40% of terms, whichever is lower
+            _min_matches = min(2, max(1, int(len(_query_terms) * 0.4)))
+            if _matched < _min_matches:
+                log.info(f"Relevance filter: skip {r.domain} "
+                         f"(matched={_matched}/{len(_query_terms)}, need≥{_min_matches}, "
+                         f"title='{r.title[:60]}')")
+                continue
         
         seen_urls.add(url_key)
         filtered.append(r)
@@ -925,13 +982,14 @@ def filter_irrelevant_results(results: list[SearchResult]) -> list[SearchResult]
 #  Source Footer Builder
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def prepare_sources(results: list[SearchResult], depth: str = "deep") -> list[SearchResult]:
+def prepare_sources(results: list[SearchResult], depth: str = "deep",
+                    query: str = "") -> list[SearchResult]:
     """Filter, deduplicate, sort by quality, remove stale results, and cap sources.
     
     MUST be used by both build_context() and build_source_footer()
     to ensure consistent numbering.
     """
-    filtered = filter_irrelevant_results(results)
+    filtered = filter_irrelevant_results(results, query=query)
 
     # ── Stale result filter ──
     # DDG sometimes returns old results despite time_filter.
@@ -991,7 +1049,7 @@ def prepare_sources(results: list[SearchResult], depth: str = "deep") -> list[Se
 
 
 def build_source_footer(results: list[SearchResult], language: str = "de",
-                        depth: str = "deep") -> str:
+                        depth: str = "deep", query: str = "") -> str:
     """
     Build a numbered source list from search results.
     Uses the same prepare_sources() as build_context()
@@ -1001,7 +1059,7 @@ def build_source_footer(results: list[SearchResult], language: str = "de",
         return ""
 
     # Use the SAME filter+cap as build_context — critical for number consistency
-    filtered = prepare_sources(results, depth)
+    filtered = prepare_sources(results, depth, query=query)
     if not filtered:
         return ""
 

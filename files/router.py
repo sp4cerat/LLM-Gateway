@@ -46,8 +46,31 @@ is_code_generation: Set to true when the user asks to CREATE, GENERATE, WRITE, B
   This includes requests in ANY language (German: "erstelle", "generiere", "programmiere", "baue";
   French: "créez", "générez"; etc.). Set to false for questions ABOUT code, explanations, or non-code tasks.
 
+needs_web: Set to true ONLY when the answer requires CURRENT, CHANGING, or SPECIFIC VERIFIABLE data.
+  TRUE — needs web search:
+  - Current/live data: weather, stock prices, news, events, scores, schedules
+  - Recent developments: new laws, policy changes, product launches, recent studies
+  - Specific verifiable claims: "does product X contain Y?", "is company Z still operating?"
+  - Local/time-sensitive: opening hours, event dates, current prices, availability
+  - Specific products/companies: reviews, specs, pricing, comparisons of named products
+  FALSE — general knowledge, answer from training data:
+  - Established science: "how does DNA work?", "what causes cancer?", "how do vaccines work?"
+  - Educational/explanatory: "what everyday things damage DNA?", "how does photosynthesis work?"
+  - History, geography, math, language, definitions
+  - How-to guides, cooking, general health advice
+  - Creative writing, opinions, coding tasks, greetings
+  - COMMANDS / tool execution: "Erstelle Ordner", "Lösche Datei", "Starte Server", "Kopiere das"
+  - File/folder operations: "create folder", "rename file", "move to", "delete"
+  - ANY imperative command meant for an agent/assistant to EXECUTE (not research)
+  - Self-referential / capability questions: "Kannst du X?", "Hast du Zugriff auf...", "Was kannst du?",
+    "Can you access...", "Do you support...", "Welche Tools hast du?"
+  - Questions ABOUT the assistant itself, its tools, features, or limitations
+  Rule of thumb: If the answer would be the same today as 2 years ago, set needs_web=false.
+  Rule of thumb: If the user wants you to DO something (create, delete, run, execute), set needs_web=false.
+  Rule of thumb: If the user asks about YOUR capabilities/access/tools, set needs_web=false.
+
 Reply ONLY with JSON:
-{"action": "...", "confidence": 0.0-1.0, "response_type": "...", "is_code_generation": true/false, "reason": "..."}
+{"action": "...", "confidence": 0.0-1.0, "response_type": "...", "is_code_generation": true/false, "needs_web": true/false, "reason": "..."}
 
 response_type must be one of:
 - explanation_generic
@@ -164,6 +187,7 @@ class IntentRouter:
                 response_type=parsed.get("response_type", "explanation_generic"),
                 reason=parsed.get("reason", f"{self.router_provider}_classified"),
                 is_code_generation=bool(parsed.get("is_code_generation", False)),
+                needs_web=bool(parsed.get("needs_web", False)),
             )
 
     def _heuristic_classify(self, query: str) -> RouterResult:
@@ -222,6 +246,7 @@ class IntentRouter:
                     confidence=0.90,
                     response_type="explanation_generic",
                     reason=f"heuristic_realtime:{pattern}",
+                    needs_web=True,
                 )
         # Check for realtime keywords combined with question words
         has_question = any(w in q for w in ["was", "wie", "what", "how", "wieviel", "how much", "which", "welche"])
@@ -232,6 +257,7 @@ class IntentRouter:
                     confidence=0.75,
                     response_type="explanation_generic",
                     reason=f"heuristic_realtime_keyword:{kw}",
+                    needs_web=True,
                 )
 
         # Premium indicators (complex code tasks)

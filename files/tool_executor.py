@@ -34,6 +34,14 @@ import httpx
 
 log = logging.getLogger("gateway.tool_executor")
 
+# Module-level config reference (set by main.py at startup)
+_config = None
+
+def set_config(config):
+    """Store config reference for tool filtering."""
+    global _config
+    _config = config
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Tool Definitions (OpenAI Function Calling Format)
@@ -183,13 +191,13 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": (
                             "Time filter for search results — YOU decide based on the query:\n"
-                            "- 'd': Last 24h. Use for: current events, 'heute', 'today', breaking news.\n"
+                            "- 'd': Last 24h. Use for: current events, 'heute', 'today', breaking news, live scores.\n"
                             "- 'w': Last week. Use for: recent news, current prices, this week's events.\n"
                             "- 'm': Last month. Use for: recent studies, policy changes, new products.\n"
-                            "- 'none': No time limit. Use for: regulations, laws, research studies, "
-                            "historical facts, established knowledge, 'Verordnung', academic topics.\n"
-                            "IMPORTANT: For medium/max research queries, prefer 'none' or 'm'. "
-                            "Using 'd' or 'w' for research topics often returns NO useful results."
+                            "- 'none': No time limit (DEFAULT). Use for: directories, contact info, regulations, "
+                            "science, how-to, reviews, established facts, 'Verordnung', academic topics.\n"
+                            "IMPORTANT: Use 'none' by default. Only use 'd'/'w' when freshness is essential. "
+                            "Directory queries (doctors, restaurants, businesses, phone numbers) MUST use 'none'."
                         ),
                         "enum": ["d", "w", "m", "none"],
                     },
@@ -214,6 +222,35 @@ TOOL_DEFINITIONS = [
     },
 ]
 
+# Maps tool function name → config.tools field name
+TOOL_SKILL_MAP = {
+    "get_weather": "weather",
+    "get_stock_price": "stocks",
+    "get_news": "news",
+    "web_search": "web_search",
+}
+
+
+def get_active_tools(config) -> list[dict]:
+    """Return only tool definitions whose skill is enabled in config.tools."""
+    if not config or not hasattr(config, 'tools') or config.tools is None:
+        return TOOL_DEFINITIONS  # All tools enabled by default
+
+    active = []
+    disabled = []
+    for tool_def in TOOL_DEFINITIONS:
+        tool_name = tool_def.get("function", {}).get("name", "")
+        skill_key = TOOL_SKILL_MAP.get(tool_name)
+        if skill_key and not getattr(config.tools, skill_key, True):
+            disabled.append(tool_name)
+            continue
+        active.append(tool_def)
+
+    if disabled:
+        log.info(f"Tools disabled by config: {disabled}")
+
+    return active
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  System Prompt for Tool-Aware Cheap Model
@@ -236,6 +273,7 @@ WHEN TO USE TOOLS:
   * Any real-time/current information that is NOT news headlines
   * Product/company/technology research
   * Event listings, schedules, comparisons
+  * ANYTHING that your other tools cannot answer (UV index, air quality, specific data)
 - ALWAYS use a tool when the user asks about current, live, or today's data
 - Do NOT answer with outdated information — use tools instead
 
@@ -251,6 +289,18 @@ CRITICAL RULES:
   "günstigste LLM Router" → search for "cheapest LLM router proxy pricing comparison 2026"
   Do NOT ask "which LLM do you want to use?" — just search and present what you find
 - If a tool returns no relevant results, answer from your knowledge and say "based on my training data"
+
+FALLBACK RULE — NEVER REFUSE WITHOUT TRYING:
+- If you realize you CANNOT answer the user's question with your available tools
+  (e.g. get_weather has no UV data, get_stock_price ticker not found, etc.),
+  you MUST include this hidden tag at the END of your response:
+  <!--FALLBACK:{"search":"optimale Suchanfrage für die Frage","reason":"kurze Begründung"}-->
+- The system will then automatically perform a web search with your suggested query.
+- NEVER tell the user "I can't do this" or "Möchtest du stattdessen..." without the FALLBACK tag.
+- NEVER ask the user to rephrase or try again — add the FALLBACK tag and the system handles it.
+- The search query should be in the same language as the user's question.
+- Example: User asks "UV Index Barcelona" → get_weather has no UV →
+  your response: "Ich suche den UV-Index für dich.<!--FALLBACK:{"search":"UV Index Barcelona aktuell","reason":"get_weather liefert keinen UV-Index"}-->"
 
 WEB SEARCH DEPTH — choose search_depth based on complexity:
   min (default, ~1s):
@@ -734,6 +784,15 @@ sind VERBINDLICH. Jeder genannte Punkt muss in der Antwort abgedeckt werden.""")
 
     # Universal quality rules
     parts.append("""
+WICHTIGSTE REGEL — FRAGE DIREKT BEANTWORTEN:
+- Lies die Nutzerfrage genau. Beantworte EXAKT das was gefragt wurde.
+- Bei Verifikations-Fragen ('stimmt das?', 'ist das korrekt?', 'ob das stimmt'):
+  → Beginne mit einer klaren Einschätzung: 'Ja, das stimmt.' / 'Teilweise korrekt.' / 'Nein, das ist falsch.'
+  → Dann erkläre Punkt für Punkt was stimmt und was nicht, mit Quellen.
+- Bei Recherche-Fragen ('was meint X zu Y?', 'was gibt es in Z?'):
+  → Beginne mit einer direkten Antwort, nicht mit einer Zusammenfassung der Quellen.
+- NIEMALS nur Quellen zusammenfassen ohne die eigentliche Frage zu beantworten.
+
 SYNTHESE-REGELN:
 - SYNTHETISIERE die Quellen zu einer kohärenten Analyse — NICHT Quelle für Quelle zusammenfassen
 - Strukturiere nach THEMATISCHEN ASPEKTEN, nicht nach Quellen
@@ -1433,7 +1492,7 @@ async def _newsapi_fetch(query: str, language: str, api_key: str) -> Optional[st
 
 
 async def tool_web_search(
-    query: str, time_filter: str = "w",
+    query: str, time_filter: str = "none",
     depth: str = "snippets", max_pages: Optional[int] = None,
     additional_queries: Optional[list[str]] = None,
     search_depth: Optional[str] = None,
@@ -1482,11 +1541,11 @@ async def tool_web_search(
     append_date = depth == "snippets"
 
     # ── Determine which engines to use ──
-    # min/medium: primary engine only, max: all configured engines
-    if depth == "thorough":
+    # min: primary engine only, medium/max: all configured engines
+    if depth in ("thorough", "deep"):
         engines = ws_cfg.engines
     else:
-        engines = ws_cfg.engines[:1]  # Just primary
+        engines = ws_cfg.engines[:1]  # Just primary for snippets
 
     log.info(f"web_search: depth={depth}, max_pages={max_pages}, "
              f"engines={engines}, tf={effective_tf}, date={append_date}, "
@@ -1584,7 +1643,7 @@ async def tool_web_search(
             # Build source footer if enabled
             source_footer = ""
             if ws_cfg.show_sources and ws_cfg.source_format == "footer":
-                source_footer = build_source_footer(merged_results, language=_lang, depth=depth)
+                source_footer = build_source_footer(merged_results, language=_lang, depth=depth, query=query)
 
             log.info(f"Deep web search: {fetched} pages, depth={depth}, "
                      f"~{len(deep_context)//4} tok, "
@@ -1749,6 +1808,20 @@ async def execute_tool_calls(tool_calls: list[dict]) -> list[dict]:
             })
             continue
 
+        # Check if tool's skill is disabled in config
+        _skill_key = TOOL_SKILL_MAP.get(func_name)
+        if _skill_key and _config and hasattr(_config, 'tools'):
+            if not getattr(_config.tools, _skill_key, True):
+                results.append({
+                    "tool_call_id": tc_id,
+                    "name": func_name,
+                    "result": (f"[Tool '{func_name}' ist nicht verfügbar. "
+                               f"Beantworte die Frage aus deinem Wissen.]"),
+                })
+                log.info(f"Tool '{func_name}' blocked (skill '{_skill_key}' disabled), "
+                         f"forwarding to LLM")
+                continue
+
         # Build async task
         if func_name == "get_weather":
             tasks.append(handler(args.get("city", "")))
@@ -1759,7 +1832,7 @@ async def execute_tool_calls(tool_calls: list[dict]) -> list[dict]:
         elif func_name == "web_search":
             tasks.append(handler(
                 args.get("query", ""),
-                args.get("time_filter", "w"),
+                args.get("time_filter", "none"),   # No restriction by default — let model/fast path set explicitly
                 args.get("depth", "snippets"),           # Legacy compat
                 args.get("max_pages"),                    # None = auto from depth
                 args.get("additional_queries"),            # Multi-query

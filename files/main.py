@@ -60,6 +60,7 @@ from response_validator import validate_response
 from data_collector import get_collector, FreeDataCollector, DataCategory, CollectedData
 from tool_executor import (
     TOOL_DEFINITIONS, TOOL_CASCADE_SYSTEM_PROMPT,
+    TOOL_SKILL_MAP, get_active_tools, set_config as set_tool_config,
     SYNTHESIS_PROMPTS, build_synthesis_prompt,
     extract_blueprint, extract_context_strategy,
     extract_output_architecture, generate_auto_architecture,
@@ -123,9 +124,15 @@ async def lifespan(app: FastAPI):
 
     # Load configuration
     config = load_config()
+    set_tool_config(config)  # Share config with tool_executor for skill filtering
     log.info(f"Config loaded: strategy={config.routing_strategy}, mock={config.mock_mode}")
     log.info(f"Budget limits: soft=${config.budget.daily_soft_limit}, "
              f"medium=${config.budget.daily_medium_limit}, hard=${config.budget.daily_hard_limit}")
+    _disabled_skills = [k for k, v in config.tools.model_dump().items() if not v]
+    if _disabled_skills:
+        log.info(f"Disabled tool skills: {_disabled_skills}")
+    else:
+        log.info(f"All tool skills enabled")
 
     # Initialize components
     rate_limiter = RateLimiter(config)
@@ -765,6 +772,95 @@ async def _try_code_stitching(
     return stitched, costs, tokens, success
 
 
+_TEXT_STITCH_MAX_ROUNDS = 2  # Text needs at most 1-2 continuations
+
+
+async def _try_text_stitching(
+    request_id: str,
+    provider,
+    model: str,
+    messages: list,
+    system_prompt: str,
+    partial_content: str,
+    max_tokens: int,
+    temperature: float,
+) -> tuple[str, list[float], list[int], bool]:
+    """
+    Continue a truncated TEXT response (non-code) on the same cheap tier.
+    Much simpler than code stitching — no syntax validation needed.
+
+    Returns:
+        (stitched_content, costs, tokens, success)
+    """
+    costs = []
+    tokens = []
+    chunks = [partial_content]
+
+    continuation_prompt = (
+        "Your previous response was cut off (token limit reached). "
+        "Continue EXACTLY where you left off. "
+        "Do NOT repeat what you already wrote. "
+        "Write ONLY the remaining part. "
+        "If the response was already complete, write only: COMPLETE"
+    )
+
+    for round_num in range(1, _TEXT_STITCH_MAX_ROUNDS + 1):
+        current_content = "\n".join(chunks)
+
+        continuation_msgs = list(messages)
+        continuation_msgs.append(
+            ChatMessage(role="assistant", content=current_content)
+        )
+        continuation_msgs.append(
+            ChatMessage(role="user", content=continuation_prompt)
+        )
+
+        try:
+            result = await _llm_call_with_retry(
+                provider,
+                messages=continuation_msgs,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system_prompt=system_prompt,
+                use_cache=False,
+            )
+        except Exception as e:
+            log.warning(f"[{request_id}] Text stitch round {round_num} failed: {e}")
+            break
+
+        costs.append(result.get("cost_usd", 0))
+        tokens.append(result["usage"].get("total_tokens", 0))
+        continuation = result.get("content", "").strip()
+        finish = result.get("finish_reason", "stop")
+
+        log.info(f"[{request_id}] Text stitch round {round_num}: "
+                 f"cont_len={len(continuation)}, finish={finish}, "
+                 f"cost=${result.get('cost_usd', 0):.6f}")
+
+        if "COMPLETE" in continuation and len(continuation) < 50:
+            log.info(f"[{request_id}] Text stitch: model reports COMPLETE")
+            return "\n".join(chunks), costs, tokens, True
+
+        if not continuation or len(continuation) < 20:
+            log.info(f"[{request_id}] Text stitch: empty continuation, stopping")
+            break
+
+        chunks.append(continuation)
+
+        if finish != "length":
+            stitched = "\n".join(chunks)
+            log.info(f"[{request_id}] Text stitch SUCCESS: "
+                     f"{len(partial_content)} → {len(stitched)} chars")
+            return stitched, costs, tokens, True
+
+    stitched = "\n".join(chunks)
+    success = len(chunks) > 1
+    log.info(f"[{request_id}] Text stitch: {'partial' if success else 'failed'}, "
+             f"total_len={len(stitched)}")
+    return stitched, costs, tokens, success
+
+
 async def _try_code_repair(
     request_id: str,
     provider,
@@ -916,6 +1012,144 @@ def _filter_source_footer(llm_response: str, source_footer: str) -> tuple[str, s
     return llm_response, source_footer
 
 
+def _parse_fallback_tag(content: str) -> dict | None:
+    """Parse <!--FALLBACK:{"search":"...","reason":"..."}-->  from model output.
+
+    Returns dict with 'search' and 'reason' keys, or None if no tag found.
+    Also strips the tag from the content.
+    """
+    if "<!--FALLBACK:" not in content:
+        return None
+    import re
+    m = re.search(r'<!--FALLBACK:\s*(\{.+?\})\s*-->', content, re.DOTALL)
+    if not m:
+        return None
+    try:
+        fb = json.loads(m.group(1))
+        if fb.get("search"):
+            fb["_stripped_content"] = content[:m.start()].rstrip()
+            return fb
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+async def _execute_fallback_search(
+    fb: dict, user_query: str, trimmed_messages: list,
+    provider, model: str, max_output: int, temperature: float,
+    system_prompt: str, request_id: str, log,
+) -> dict | None:
+    """Execute a FALLBACK web search and synthesise the results.
+
+    Returns dict with 'content', 'cost', 'tokens' keys on success, None on failure.
+    """
+    _search_query = fb.get("search", user_query)
+    _reason = fb.get("reason", "fallback")
+    log.info(f"[{request_id}] FALLBACK tag → web_search('{_search_query}') "
+             f"reason='{_reason}'")
+    try:
+        ws_result = await tool_web_search(query=_search_query, depth="deep")
+        if not ws_result or ws_result.startswith("Keine Ergebnisse"):
+            return None
+        synth_prompt = build_synthesis_prompt("deep")
+        synth_msgs = []
+        for m in trimmed_messages:
+            synth_msgs.append({"role": m.role, "content": m.text_content})
+        synth_msgs.append({
+            "role": "user",
+            "content": f"{ws_result}\n\n{synth_prompt}",
+        })
+        synth_result = await provider.chat(
+            messages=[ChatMessage(**m) for m in synth_msgs],
+            model=model, max_tokens=max_output,
+            temperature=temperature,
+            system_prompt=system_prompt,
+        )
+        return {
+            "content": synth_result.get("content", ""),
+            "cost": synth_result.get("cost_usd", 0),
+            "tokens": synth_result["usage"].get("total_tokens", 0),
+            "llm_result": synth_result,
+        }
+    except Exception as e:
+        log.warning(f"[{request_id}] FALLBACK web search failed: {e}")
+        return None
+    """Filter source footer to only include sources actually referenced in the LLM response.
+    Returns (updated_response, filtered_footer) with consistent renumbering.
+
+    Matches these reference formats in the LLM response:
+      - [1], [2], [3]                  (new format)
+      - [1, 3, 5]                      (grouped new format)
+      - (Quelle 1), (Quelle 1, 2, 3)  (legacy format)
+      - (Source 1, 3)                  (legacy English)
+
+    The source footer contains lines like "[1] https://... — Title".
+    Only keeps footer lines whose [N] number was actually referenced.
+    If no numbered references are found, returns all sources unchanged.
+    Renumbers both the response text AND footer to be sequential.
+    """
+    import re
+
+    referenced_nums = set()
+
+    # Pattern 1: [N] inline references — e.g. "text [1]." or "text [3]"
+    # Match [N] that is NOT at the start of a line (to avoid matching footer lines)
+    for m in re.finditer(r'(?<!^)\[(\d+)\]', llm_response, re.MULTILINE):
+        referenced_nums.add(int(m.group(1)))
+
+    # Pattern 2: [N, M, ...] grouped references — e.g. "[1, 3, 5]"
+    for m in re.finditer(r'\[(\d+(?:\s*,\s*\d+)+)\]', llm_response):
+        for num_str in re.findall(r'\d+', m.group(1)):
+            referenced_nums.add(int(num_str))
+
+    # Pattern 3: (Quelle N) or (Quelle N, M) — legacy format
+    for m in re.findall(
+        r'\((?:Quelle|Source|Src|Q)[\s:]+([0-9,\s]+)\)', llm_response, re.IGNORECASE
+    ):
+        for num_str in re.findall(r'\d+', m):
+            referenced_nums.add(int(num_str))
+
+    # If no numbered references found at all, the model didn't use any sources
+    # This usually means the sources were irrelevant — don't return footer
+    if not referenced_nums:
+        return llm_response, ""
+
+    # Parse footer lines and keep only referenced ones, building renumber map
+    footer_lines = source_footer.strip().split("\n")
+    filtered = []
+    renumber_map = {}  # old_num → new_num
+    new_idx = 1
+    for line in footer_lines:
+        # Keep header lines (---, "Quellen:", "Sources:")
+        if line.startswith("---") or line.endswith(":"):
+            filtered.append(line)
+            continue
+        # Parse [N] from footer line
+        num_match = re.match(r'\[(\d+)\]', line)
+        if num_match:
+            orig_num = int(num_match.group(1))
+            if orig_num in referenced_nums:
+                renumber_map[orig_num] = new_idx
+                filtered.append(re.sub(r'^\[\d+\]', f'[{new_idx}]', line))
+                new_idx += 1
+
+    # Return filtered footer (or all if filtering removed everything)
+    if new_idx > 1 and renumber_map:
+        # Renumber references in the response text to match new footer numbering
+        updated_response = llm_response
+        # Use placeholders to avoid collision (e.g., [4]→[2] then [2]→[1])
+        # Step 1: Replace all old refs with unique placeholders
+        for old_num in renumber_map:
+            updated_response = updated_response.replace(
+                f"[{old_num}]", f"[__REF_{old_num}__]")
+        # Step 2: Replace placeholders with new numbers
+        for old_num, new_num in renumber_map.items():
+            updated_response = updated_response.replace(
+                f"[__REF_{old_num}__]", f"[{new_num}]")
+        return updated_response, "\n".join(filtered)
+    return llm_response, source_footer
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest, raw_request: Request = None,
                            auth: bool = Depends(verify_auth)):
@@ -975,6 +1209,10 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         # Detect, transcribe via Whisper, replace with text before LLM sees it.
         has_audio = has_media and any('audio' in mt.lower() for mt in media_types)
 
+        # Skip audio processing entirely if transcription is disabled
+        if not config.tools.transcription:
+            has_audio = False
+
         # Also check for audio file paths in text (OpenClaw pattern)
         # Pattern 1: Files WITH extension (e.g. /path/to/file.ogg)
         _AUDIO_PATH_RE = re.compile(
@@ -987,7 +1225,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
             re.IGNORECASE
         )
         audio_file_path = None
-        if not has_audio and user_query:
+        if not has_audio and user_query and config.tools.transcription:
             # Try extension-based match first
             m = _AUDIO_PATH_RE.search(user_query)
             if m:
@@ -1283,10 +1521,15 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         _needs_web_search = False   # Set by planning/web keyword detection
         tier = None  # Will be set by routing logic below
 
+        _explicit_tier = False  # User explicitly selected a tier (not auto)
         if request.model and request.model != "auto":
             # Explicit model selection — skip routing
             tier = request.model if request.model in ("local", "cheap", "cheap_plus", "medium", "premium") else "premium"
-            cascade_mode = False
+            _explicit_tier = True
+            # Keep cascade_mode for cheap/cheap_plus so tools still work
+            # Disable only for medium/premium (no escalation needed)
+            if tier not in ("cheap", "cheap_plus"):
+                cascade_mode = False
 
         else:
             # ─── Step 5a: Build Context Map for large requests ────
@@ -1345,6 +1588,42 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     # Fall through to cascade below (don't use elif)
 
             # ─── Step 5c: Original cascade (small context) ────────
+            _routing_query = user_query  # Default; may be refined below
+
+            # Agent sessions: Strip conversation metadata and system logs from query
+            # This MUST run before routing so all paths get a clean query.
+            if _is_agent_session and _routing_query:
+                # Strip "Conversation info (untrusted metadata):" + JSON block
+                # Pattern: metadata header → ```json ... ``` → actual user text
+                _meta_match = re.search(
+                    r'(?:Conversation info[^:]*:.*?```(?:json)?\s*\{[^}]*\}\s*```\s*)(.*?)$',
+                    _routing_query, re.DOTALL
+                )
+                if _meta_match:
+                    _routing_query = _meta_match.group(1).strip()
+                    log.debug(f"[{request_id}] Agent routing: stripped conversation metadata, "
+                              f"query='{_routing_query[:80]}'")
+                # Also try: metadata without fences (inline JSON)
+                elif re.match(r'Conversation info', _routing_query):
+                    _meta_match2 = re.search(
+                        r'\}\s*\n+(.*?)$', _routing_query, re.DOTALL
+                    )
+                    if _meta_match2:
+                        _routing_query = _meta_match2.group(1).strip()
+                        log.debug(f"[{request_id}] Agent routing: stripped inline metadata, "
+                                  f"query='{_routing_query[:80]}'")
+
+                # Pattern: "System: [...] ...\n\n[Telegram Sven ...] actual message"
+                if "\n" in _routing_query:
+                    _tg_match = re.search(
+                        r'\[Telegram [^\]]+\]\s*(.+?)(?:\s*\[message_id:\s*\d+\])?\s*$',
+                        _routing_query, re.DOTALL
+                    )
+                    if _tg_match:
+                        _routing_query = _tg_match.group(1).strip()
+                        log.debug(f"[{request_id}] Agent routing: stripped system logs, "
+                                  f"query='{_routing_query[:80]}'")
+
             if cascade_mode and tier is None:
                 # For document QA, use much higher thresholds
                 # Gemini Flash has 1M token context — no need to escalate for documents
@@ -1352,27 +1631,12 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     CHEAP_MAX_TOKENS = 50000
                     MEDIUM_MAX_TOKENS = 100000
                     routing_tokens = total_request_tokens  # Doc size matters
-                    _routing_query = user_query  # No stripping needed for doc QA
                 else:
                     CHEAP_MAX_TOKENS = 500
                     MEDIUM_MAX_TOKENS = 3000
                     # Use QUERY complexity for routing, not total request size
                     # OpenClaw/chat clients add 2000-5000 tok of system prompt + history
                     # A simple "Wie wird das Wetter" should stay cheap regardless
-                    _routing_query = user_query
-                    # Agent sessions: OpenClaw prepends system logs (exec failures, etc.)
-                    # to user messages, inflating token count. Extract actual user text.
-                    # Pattern: "System: [...] ...\n\n[Telegram Sven ...] actual message"
-                    if _is_agent_session and "\n" in _routing_query:
-                        # Find the actual Telegram message after system logs
-                        _tg_match = re.search(
-                            r'\[Telegram [^\]]+\]\s*(.+?)(?:\s*\[message_id:\s*\d+\])?\s*$',
-                            _routing_query, re.DOTALL
-                        )
-                        if _tg_match:
-                            _routing_query = _tg_match.group(1).strip()
-                            log.debug(f"[{request_id}] Agent routing: stripped system logs, "
-                                      f"query='{_routing_query[:80]}'")
                     routing_tokens = estimate_tokens(_routing_query)
                 log.info(f"[{request_id}] Cascade routing: routing_tok={routing_tokens} | "
                          f"total_req_tok={total_request_tokens} | "
@@ -1391,57 +1655,40 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     tier = "cheap"
 
                 # ── Web search upgrade: cheap → cheap_plus ──
-                # Detect queries that need web search even when token count is low.
-                if tier == "cheap":
-                    _q_lower = _routing_query.lower()
-                    _web_search_signals = [
-                        # Explicit research requests (DE/EN)
-                        "recherchiere", "recherche zu", "recherche über",
-                        "research", "investigate", "look up",
-                        # Source/data requests
-                        "aktuelle studien", "aktuelle quellen", "nutze quellen",
-                        "nutze aktuelle", "aktuelle daten", "aktuelle zahlen",
-                        "finde heraus", "finde informationen", "suche nach",
-                        "search for", "find out about",
-                        # Real-time data
-                        "aktuelle nachrichten", "latest news",
-                        "spielstand", "score of", "ergebnis von",
-                        "öffnungszeiten", "opening hours",
-                        "wie spät", "what time",
-                    ]
-                    # Also check: realtime keywords + question words
-                    _realtime_kw = ["aktuell", "currently", "gerade", "heute",
-                                    "today", "live", "jetzt", "derzeit"]
-                    _question_words = ["was", "wie", "what", "how", "wieviel",
-                                       "welche", "which", "wann", "when"]
-                    _planning_kw = ["plant", "plans", "vorhaben", "position",
-                                    "wahlprogramm", "koalition", "regierung",
-                                    "gesetzentwurf", "reform", "beschlossen",
-                                    "policy", "legislation", "regulation"]
-                    _has_realtime = any(kw in _q_lower for kw in _realtime_kw)
-                    _has_question = any(w in _q_lower for w in _question_words)
-                    _has_planning = any(kw in _q_lower for kw in _planning_kw)
-
-                    needs_web = (
-                        any(sig in _q_lower for sig in _web_search_signals)
-                        or (_has_realtime and _has_question)
-                        or (_has_planning and _has_question)
-                    )
-                    # Exclude queries handled by dedicated tools (weather, stocks)
-                    _tool_handled = ["dax", "aktie", "aktien", "börse", "stock",
-                                     "share price", "kurs", "portfolio", "index",
-                                     "dow", "nasdaq", "s&p", "nikkei", "ftse",
-                                     "wetter", "weather", "temperatur", "temperature",
-                                     "forecast", "vorhersage"]
-                    if needs_web and any(t in _q_lower for t in _tool_handled):
-                        needs_web = False
-                        log.info(f"[{request_id}] Web upgrade suppressed: "
-                                 f"query matches tool-handled pattern, staying on cheap")
-                    if needs_web:
-                        tier = "cheap_plus"
-                        _needs_web_search = True
-                        log.info(f"[{request_id}] Web search upgrade: cheap → cheap_plus "
-                                 f"(query needs web data)")
+                # Use LLM router classification (language-agnostic) instead of keyword lists.
+                # The router prompt includes needs_web detection for factual/current-data queries.
+                if tier == "cheap" and config.tools.web_search:
+                    try:
+                        _web_route = await intent_router.route(_routing_query)
+                        # Guard: commands and code generation never need web search
+                        if _web_route.needs_web and (
+                            _web_route.is_code_generation
+                            or _web_route.response_type == "command_execution"
+                        ):
+                            log.info(f"[{request_id}] Web search suppressed: "
+                                     f"is_code={_web_route.is_code_generation}, "
+                                     f"type={_web_route.response_type} → needs_web forced False")
+                            _web_route.needs_web = False
+                            _web_route.reason += " [web suppressed: code/command]"
+                        if _web_route.needs_web:
+                            tier = "cheap_plus"
+                            _needs_web_search = True
+                            route_result = _web_route  # Save for metadata
+                            log.info(f"[{request_id}] Web search upgrade: cheap → cheap_plus "
+                                     f"(router: needs_web=True, reason={_web_route.reason})")
+                        elif _web_route.action.value == "cheap_plus":
+                            # Router classified as CHEAP_PLUS even without explicit needs_web
+                            tier = "cheap_plus"
+                            _needs_web_search = True
+                            route_result = _web_route
+                            log.info(f"[{request_id}] Web search upgrade: cheap → cheap_plus "
+                                     f"(router: action=cheap_plus)")
+                        else:
+                            route_result = _web_route  # Save for metadata/code detection
+                    except Exception as e:
+                        log.warning(f"[{request_id}] Web search router failed: {e}, "
+                                    f"staying on cheap")
+                        route_result = None
 
                 # ── Code generation upgrade: cheap → medium ──
                 # Only for LONG code tasks (200+ lines, full programs).
@@ -1576,7 +1823,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
             tier = "cheap"
 
         vision_result = None
-        if has_media:
+        if has_media and config.tools.vision:
             # Extract image data from last user message
             last_user_msg = None
             for msg in reversed(request.messages):
@@ -1786,8 +2033,11 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                         f"Heutiges Datum: {_today_hint}\n\n"
                         "CRITICAL TOOL RULES (MUST FOLLOW):\n"
                         "1. NEVER output Python code as text. No print(), no default_api calls as text.\n"
-                        "2. For ANY factual question, knowledge, news, politics, events → call web_search tool\n"
-                        "3. For weather → call get_weather tool\n"
+                        "2. For ANY factual question → PREFER calling web_search FIRST.\n"
+                        "   This includes science, health, law, technology, products, materials.\n"
+                        "   Do NOT answer from memory for factual/technical questions.\n"
+                        "   Only skip web_search for: greetings, opinions, math, coding, creative writing.\n"
+                        "3. For weather → call get_weather tool (short-range) or web_search (7+ days)\n"
                         "4. For stock prices → call get_stock_price tool\n"
                         "5. memory_search is ONLY for recalling past user conversations. "
                         "NEVER use memory_search for general knowledge questions.\n"
@@ -1797,17 +2047,38 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                         '   - additional_queries: add 1-2 alternative search terms for better coverage\n'
                         '   - time_filter: Choose based on the query:\n'
                         '     "d" = last 24h → for "heute", "today", breaking news, live events\n'
-                        '     "w" = last week → for "diese Woche", current events, recent prices\n'
+                        '     "w" = last week → ONLY for: "diese Woche", breaking news, current prices\n'
                         '     "m" = last month → for recent studies, policy changes, new products\n'
-                        '     "none" = no limit → for laws, regulations, research, established facts\n'
+                        '     "none" = no limit (DEFAULT) → for directories, facts, laws, science, reviews\n'
+                        '   IMPORTANT: Use time_filter="none" by default! Only use "d"/"w" for time-critical queries.\n'
+                        '   Example: web_search(query="Hausärzte Konstanz Telefonnummer",\n'
+                        '            search_depth="medium", time_filter="none")\n'
                         '   Example: web_search(query="Veranstaltungen Konstanz Februar 2026",\n'
-                        '            search_depth="medium", time_filter="w",\n'
+                        '            search_depth="medium", time_filter="m",\n'
                         '            additional_queries=["Events Bodensee Wochenende"])\n'
                         '   Example: web_search(query="EU Batterieverordnung 2026",\n'
-                        '            search_depth="medium", time_filter="none")'
+                        '            search_depth="medium", time_filter="none")\n'
+                        "8. ANSWER QUESTIONS — NEVER DEFLECT:\n"
+                        "   - When the user asks a question, your job is to ANSWER it.\n"
+                        "   - If a tool only gives PARTIAL data (e.g. weather for 3 days but user asks for next week),\n"
+                        "     call web_search for the missing part. Do NOT tell the user you can only give partial data.\n"
+                        "   - NEVER say 'benötige weitere Informationen', 'kann ich dir leider nicht',\n"
+                        "     'Möchtest du stattdessen...' or similar. ALWAYS search or add FALLBACK.\n"
+                        "   - If you CANNOT answer with your tools, include this HIDDEN tag at the END:\n"
+                        '     <!--FALLBACK:{"search":"best search query for this question","reason":"why tools failed"}-->\n'
+                        "   - The system will automatically do a web search with your suggested query.\n"
+                        "   - NEVER respond without either: (a) calling a tool, (b) answering from knowledge, or (c) FALLBACK tag.\n"
+                        "   - Examples:\n"
+                        '     User: "Wetter nächste Woche Mallorca" → call web_search(query="Wetter Mallorca nächste Woche Vorhersage")\n'
+                        '     User: "UV Index Barcelona" → get_weather has no UV → add <!--FALLBACK:{"search":"UV Index Barcelona aktuell",...}-->\n'
+                        '     User: "¿Qué eventos hay en Madrid?" → call web_search(query="eventos Madrid esta semana")'
                         + ("\n⚠️ THIS QUERY REQUIRES CURRENT DATA. You MUST call web_search "
                            "before answering. Do NOT answer from memory alone."
-                           if _needs_web_search else "")
+                           if _needs_web_search
+                           else ("\n💡 This looks like a factual question. PREFER web_search "
+                                 "over answering from memory to ensure accuracy."
+                                 if (route_result and getattr(route_result, 'needs_web', False))
+                                 else ""))
                     ),
                 )
                 # Insert before last user message
@@ -1857,11 +2128,13 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                  f"is_doc_qa={is_doc_qa} | model={request.model}")
 
         # Determine which tools to pass to the LLM
+        # Filter tools based on config.tools enable/disable flags
+        _active_tools = get_active_tools(config)
         # For agent sessions: merge client tools + gateway tools so the model can
         # use web_search/weather/stocks AND the agent's own tools (exec, write, etc.)
         _gateway_tool_names = set()
         if _is_agent_session and request.tools:
-            _gateway_tool_names = {t["function"]["name"] for t in TOOL_DEFINITIONS
+            _gateway_tool_names = {t["function"]["name"] for t in _active_tools
                                    if "function" in t}
             # Merge: client tools + gateway tools (skip duplicates)
             _client_tool_names = set()
@@ -1870,13 +2143,13 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 if fname:
                     _client_tool_names.add(fname)
             # Add gateway tools that the client doesn't already provide
-            _extra_gateway = [t for t in TOOL_DEFINITIONS
+            _extra_gateway = [t for t in _active_tools
                               if t.get("function", {}).get("name") not in _client_tool_names]
             _effective_tools = list(request.tools) + _extra_gateway
             log.info(f"[{request_id}] Agent session: {len(request.tools)} client tools + "
                      f"{len(_extra_gateway)} gateway tools = {len(_effective_tools)} total")
         elif use_tools:
-            _effective_tools = TOOL_DEFINITIONS  # Gateway tools only
+            _effective_tools = _active_tools  # Gateway tools only
         else:
             _effective_tools = None
 
@@ -1892,21 +2165,141 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                                     f",{_clen}c)")
             log.info(f"[{request_id}] Agent messages: {' → '.join(_msg_summary)}")
 
-        llm_result = await _llm_call_with_retry(
-            provider,
-            messages=trimmed_messages,
-            model=model,
-            max_tokens=max_output,
-            temperature=request.temperature or 0.7,
-            system_prompt=system_prompt,
-            use_cache=use_cache,
-            tools=_effective_tools,
-            tool_choice=request.tool_choice if _is_agent_session else None,
-        )
+        # ── FAST PATH: Agent + _needs_web_search → skip heavy first LLM, optimize search ──
+        # Instead of a full LLM call with 10K+ tokens of agent context (8s),
+        # we do a tiny LLM call (just the question, ~1s) to generate optimal search keywords,
+        # then go straight to web_search. Total: ~4s instead of 11s.
+        _used_fast_web_path = False
+        if (_is_agent_session and _needs_web_search
+                and not _explicit_tier  # Respect explicit tier selection
+                and len(_routing_query.split()) >= 3):  # Not a greeting
+            log.info(f"[{request_id}] FAST WEB PATH: optimizing search query for "
+                     f"'{_routing_query[:60]}'")
+            
+            # Quick LLM call: just generate search keywords (no agent context needed)
+            try:
+                _sq_result = await provider.chat(
+                    messages=[],
+                    model=model,
+                    max_tokens=200,
+                    temperature=0.3,
+                    raw_messages=[
+                        {"role": "system", "content": (
+                            "Generate optimal web search queries for the user's question.\n"
+                            "Return ONLY a JSON object with this format:\n"
+                            '{"queries": ["query1", "query2"], "time_filter": "none"}\n\n'
+                            "QUERY RULES:\n"
+                            "- 1-3 keyword-rich search queries, remove filler words (liste, alle, zeige, bitte)\n"
+                            "- For directory/listing queries: use domain-specific terms\n"
+                            "- Vary phrasing between queries for broader coverage\n\n"
+                            "TIME_FILTER:\n"
+                            '- "d" = last 24h (breaking news, today\'s weather/scores)\n'
+                            '- "w" = last week (recent events, current prices)\n'
+                            '- "m" = last month (recent developments)\n'
+                            '- "none" = no time limit (directories, evergreen facts, how-to, science)\n\n'
+                            "EXAMPLES:\n"
+                            'User: "Liste Hausärzte Konstanz mit Telefon"\n'
+                            '→ {"queries": ["Hausärzte Konstanz Telefonnummer Adresse", "Allgemeinmediziner Konstanz Arztsuche"], "time_filter": "none"}\n'
+                            'User: "Wetter Koblenz nächste Woche"\n'
+                            '→ {"queries": ["Wetter Koblenz 7 Tage Vorhersage"], "time_filter": "none"}\n'
+                            'User: "Was ist gestern in Berlin passiert"\n'
+                            '→ {"queries": ["Berlin Nachrichten gestern", "Berlin News aktuell"], "time_filter": "d"}'
+                        )},
+                        {"role": "user", "content": _routing_query},
+                    ],
+                )
+                _sq_text = (_sq_result.get("content", "") or "").strip()
+                # Parse JSON object
+                import json as _json_sq
+                # Strip markdown fences if present
+                if _sq_text.startswith("```"):
+                    _sq_text = _sq_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+                _sq_parsed = _json_sq.loads(_sq_text)
+                
+                # Handle both old array format and new object format
+                if isinstance(_sq_parsed, list):
+                    _search_queries = _sq_parsed
+                    _fast_tf = "none"
+                elif isinstance(_sq_parsed, dict):
+                    _search_queries = _sq_parsed.get("queries", [_routing_query])
+                    _fast_tf = _sq_parsed.get("time_filter", "none")
+                else:
+                    _search_queries = [_routing_query]
+                    _fast_tf = "none"
+                
+                if isinstance(_search_queries, list) and len(_search_queries) >= 1:
+                    _primary_q = str(_search_queries[0])
+                    _additional = [str(q) for q in _search_queries[1:3]]
+                    log.info(f"[{request_id}] Fast path: queries={_search_queries}, "
+                             f"time_filter={_fast_tf}")
+                else:
+                    _primary_q = _routing_query
+                    _additional = []
+                    _fast_tf = "none"
+                _fast_path_cost = _sq_result.get("cost_usd", 0)
+                _fast_path_tokens = _sq_result.get("usage", {}).get("total_tokens", 0)
+            except Exception as _sq_err:
+                log.warning(f"[{request_id}] Fast path query optimization failed: {_sq_err}, "
+                            f"using raw query")
+                _primary_q = _routing_query
+                _additional = []
+                _fast_tf = "none"
+            
+            import uuid as _uuid_fast
+            _fast_tc_id = f"fast_{_uuid_fast.uuid4().hex[:8]}"
+            # Build optimized search arguments
+            _search_args = {
+                "query": _primary_q,
+                "search_depth": "medium",
+                "time_filter": _fast_tf,
+            }
+            if _additional:
+                _search_args["additional_queries"] = _additional
+            
+            # Set up tool_calls for web_search execution
+            tool_calls = [{
+                "id": _fast_tc_id,
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "arguments": json.dumps(_search_args),
+                },
+            }]
+            # Build synthetic first LLM result
+            llm_result = {
+                "content": "",
+                "finish_reason": "stop",
+                "cost_usd": 0,
+                "tool_calls": tool_calls,
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+            response_content = ""
+            _forced_web_search = True
+            _used_fast_web_path = True
+            metrics.increment("agent_fast_web_path")
+        else:
+            llm_result = await _llm_call_with_retry(
+                provider,
+                messages=trimmed_messages,
+                model=model,
+                max_tokens=max_output,
+                temperature=request.temperature or 0.7,
+                system_prompt=system_prompt,
+                use_cache=use_cache,
+                tools=_effective_tools,
+                tool_choice=request.tool_choice if _is_agent_session else None,
+            )
 
         # Track cascade costs
         cascade_costs = [llm_result.get("cost_usd", 0)]
         cascade_tokens = [llm_result["usage"].get("total_tokens", 0)]
+        # Add fast path query optimization cost if applicable
+        if _used_fast_web_path:
+            try:
+                cascade_costs.insert(0, _fast_path_cost)
+                cascade_tokens.insert(0, _fast_path_tokens)
+            except NameError:
+                pass  # _fast_path_cost not set if optimization failed early
         escalated_to = None
         validation_escalated = None  # Set by Step 11d if response validation fails
         code_stitched = False        # Set by Step 11d if code stitching succeeded
@@ -1924,6 +2317,8 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                  f"input_tok={llm_result['usage'].get('prompt_tokens',0)}")
 
         # ─── Step 11b: Tool Calling Loop + Escalation ─────────────────
+        if not _used_fast_web_path:
+            _forced_web_search = False  # May be set by forced web search guards below
         if use_tools or _is_agent_session:
             tool_calls = llm_result.get("tool_calls")
             response_content = llm_result.get("content", "").strip()
@@ -1969,8 +2364,22 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
             #    but no web_search was called → hallucinated sources
             # 3. Model deflects ("konnte keine Informationen finden", "empfehle 
             #    lokale Webseite") without actually searching → lazy deflection
-            _forced_web_search = False
-            if _is_agent_session and not tool_calls:
+            #
+            # IMPORTANT: In agent sessions with recent tool history, be conservative.
+            # The agent may answer follow-up questions about its own prior actions
+            # (e.g. "why can't I access the server you started?") without needing
+            # web search. Only force web search for clear hallucination signals.
+            _forced_web_search = _forced_web_search if _used_fast_web_path else False
+
+            # Check if agent has recent tool calls in conversation history
+            _agent_has_tool_history = False
+            if _is_agent_session:
+                for _hist_msg in reversed(request.messages[-8:]):
+                    if getattr(_hist_msg, 'tool_calls', None) or getattr(_hist_msg, 'tool_call_id', None):
+                        _agent_has_tool_history = True
+                        break
+
+            if _is_agent_session and not tool_calls and not _used_fast_web_path:
                 _has_web_call = False
                 if llm_result.get("tool_calls"):
                     _has_web_call = any(
@@ -2008,21 +2417,55 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     and not _has_web_call
                 )
 
+                # ── FALLBACK tag: model explicitly requests web search ──
+                _agent_fallback = _parse_fallback_tag(_resp)
+                _has_fallback_tag = _agent_fallback is not None
+
+                # ── Safety net: short response without tool call or FALLBACK
+                # that looks like a refusal (language-agnostic: check length + no tool) ──
+                _is_short_refusal = (
+                    not _has_web_call
+                    and not _has_fallback_tag
+                    and len(_resp) < 300
+                    and len(_resp) > 10  # Not empty
+                    and not tool_calls  # No tools called at all
+                    and _routing_query  # There was a real question
+                    and len(_routing_query.split()) >= 3  # Not a greeting
+                )
+
+                # ── Uncertain answer: model answered from memory but router said needs_web ──
+                # Language-agnostic: uses router classification, not keyword lists.
+                _router_needs_web = (route_result and getattr(route_result, 'needs_web', False))
+                _is_uncertain_answer = (
+                    not _has_web_call
+                    and not _has_fallback_tag
+                    and len(_resp) > 100
+                    and not tool_calls
+                    and _router_needs_web  # Router said this needs web search
+                )
+
                 # Check if query is a short greeting/chat (not worth web searching)
                 _rq_words = _routing_query.split()
-                _question_words_check = {"was", "wie", "what", "how", "wieviel",
-                                         "welche", "which", "wann", "when", "wo",
-                                         "where", "wer", "who", "warum", "why"}
-                _is_greeting = (
-                    len(_rq_words) <= 2
-                    and not any(w.lower() in _question_words_check
-                                for w in _rq_words)
-                )
+                _is_greeting = len(_rq_words) <= 2
 
                 _should_force = (
                     not _is_greeting and not _has_web_call
-                    and (_needs_web_search or _has_fake_citations or _has_deflection)
+                    and (_needs_web_search or _has_fake_citations
+                         or _has_deflection or _has_fallback_tag
+                         or _is_short_refusal or _is_uncertain_answer)
                 )
+
+                # In agent sessions with recent tool history, be much more conservative.
+                # The agent likely answers about its own prior actions (servers, files, etc.)
+                # Only force web search for clear hallucination (fake citations/fallback tag).
+                if _should_force and _agent_has_tool_history:
+                    _conservative_force = (_has_fake_citations or _has_fallback_tag)
+                    if not _conservative_force:
+                        log.info(f"[{request_id}] Forced web search suppressed: "
+                                 f"agent has tool history, trigger would be "
+                                 f"deflection={_has_deflection} refusal={_is_short_refusal} "
+                                 f"uncertain={_is_uncertain_answer} needs_web={_needs_web_search}")
+                        _should_force = False
 
                 if _is_greeting and _has_fake_citations:
                     # Short greeting with hallucinated sources → strip citations
@@ -2039,12 +2482,17 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                              f"from greeting response (query='{_routing_query}')")
 
                 elif _should_force:
-                    _trigger = ("needs_web" if _needs_web_search 
+                    _trigger = ("fallback_tag" if _has_fallback_tag
+                                else "needs_web" if _needs_web_search 
                                 else "hallucinated_citations" if _has_fake_citations
-                                else "lazy_deflection")
+                                else "lazy_deflection" if _has_deflection
+                                else "short_refusal" if _is_short_refusal
+                                else "uncertain_answer")
+                    # Use FALLBACK search query if available, else routing query
+                    _search_q = (_agent_fallback.get("search", _routing_query)
+                                 if _agent_fallback else _routing_query)
                     log.warning(f"[{request_id}] Agent forced web_search "
-                                f"(trigger={_trigger}): model didn't call web_search, "
-                                f"executing for query: '{_routing_query[:80]}'")
+                                f"(trigger={_trigger}): query='{_search_q[:80]}'")
                     metrics.increment("agent_forced_web_search",
                                       tags={"trigger": _trigger})
                     # Build a synthetic web_search tool call
@@ -2056,7 +2504,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                         "function": {
                             "name": "web_search",
                             "arguments": json.dumps({
-                                "query": _routing_query,
+                                "query": _search_q,
                                 "search_depth": "medium",
                             }),
                         },
@@ -2074,6 +2522,48 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 tools_used = [tr["name"] for tr in tool_results]
                 metrics.increment("tool_calls_executed",
                                   tags={"tools": ",".join(tools_used)})
+
+                # ── Tool failure fallback: if get_weather/get_stock/get_news failed
+                # or returned unhelpful data, add a web_search for the original query ──
+                _fallback_tools = {"get_weather", "get_stock_price", "get_news"}
+                _failure_indicators = [
+                    "fehler", "error", "keine daten", "nicht verfügbar",
+                    "not available", "no data", "not found", "failed",
+                    "timeout", "rate limit", "api limit",
+                ]
+                _failed_tools = [
+                    tr for tr in tool_results
+                    if tr["name"] in _fallback_tools
+                    and (
+                        tr["result"].startswith("Fehler")
+                        or any(ind in tr["result"].lower()[:200]
+                               for ind in _failure_indicators)
+                        or len(tr["result"].strip()) < 20
+                    )
+                ]
+                if _failed_tools and not any(tr["name"] == "web_search" for tr in tool_results):
+                    _failed_names = [tr["name"] for tr in _failed_tools]
+                    log.warning(f"[{request_id}] Tool failure fallback: "
+                                f"{_failed_names} failed → adding web_search")
+                    import uuid as _uuid_fb
+                    _fb_tc_id = f"fallback_{_uuid_fb.uuid4().hex[:8]}"
+                    _fb_tool_call = {
+                        "id": _fb_tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": json.dumps({
+                                "query": _routing_query or user_query,
+                                "search_depth": "medium",
+                            }),
+                        },
+                    }
+                    _fb_results = await execute_tool_calls([_fb_tool_call])
+                    tool_calls.append(_fb_tool_call)
+                    tool_results.extend(_fb_results)
+                    tools_used = [tr["name"] for tr in tool_results]
+                    metrics.increment("tool_failure_web_fallback",
+                                      tags={"failed": ",".join(_failed_names)})
 
                 # Build follow-up messages with tool results (OpenAI format)
                 follow_up = []
@@ -2133,21 +2623,38 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     synthesis_prompt = (
                         f"Du bist ein hilfreicher Recherche-Assistent. Heutiges Datum: {_today}.\n"
                         "Dir wurden Suchergebnisse bereitgestellt.\n\n"
+                        "WICHTIGSTE REGEL — FRAGE DIREKT BEANTWORTEN:\n"
+                        "- Lies die Nutzerfrage genau. Beantworte EXAKT das was gefragt wurde.\n"
+                        "- Bei Verifikations-Fragen ('stimmt das?', 'ist das korrekt?'):\n"
+                        "  → Beginne mit klarer Einschätzung: 'Ja.' / 'Teilweise.' / 'Nein.'\n"
+                        "  → Dann erkläre was stimmt und was nicht.\n"
+                        "- Bei Recherche-Fragen: Beginne mit direkter Antwort.\n"
+                        "- NIEMALS die Frage ignorieren oder nur Quellen zusammenfassen.\n\n"
+                        "DATENEXTRAKTION:\n"
+                        "- Extrahiere ALLE verfügbaren Datenfelder aus den Quellen.\n"
+                        "  Bei Personen/Einrichtungen: Name, Adresse, Telefon, Öffnungszeiten etc.\n"
+                        "  Bei Produkten: Name, Preis, Spezifikationen etc.\n"
+                        "  Bei Ereignissen: Name, Datum, Ort, Uhrzeit etc.\n"
+                        "- KOMBINIERE Informationen aus verschiedenen Quellen zum selben Eintrag.\n"
+                        "  Wenn Quelle [1] die Adresse hat und [2] den Namen → beide angeben.\n"
+                        "- Lücken: Wenn ein Feld fehlt, lass es weg statt Platzhalter zu erfinden.\n"
+                        "- Bevorzuge Vollständigkeit pro Eintrag über maximale Anzahl Einträge.\n\n"
                         "ANTWORT-FORMAT:\n"
-                        "- Beginne mit einer klaren Zusammenfassung in 1-2 Sätzen\n"
-                        "- Gliedere mit **fetten Überschriften** wo sinnvoll (2-4 Abschnitte)\n"
-                        "- Verwende konkrete Zahlen und Fakten aus den Quellen\n"
-                        "- Nenne Datumsangaben und zeitliche Einordnung wenn relevant\n"
-                        "- Schließe mit einem kurzen **Fazit** oder Einordnung ab\n"
-                        "- Liste Quellen als nummerierte Links am Ende: [1] URL — Titel\n\n"
+                        "- Beginne mit 1-2 Sätzen die die Frage direkt beantworten\n"
+                        "- Gliedere mit **fetten Überschriften** wo sinnvoll\n"
+                        "- Verwende konkrete Zahlen, Daten, Fakten aus den Quellen\n"
+                        "- Verwende inline-Referenzen [1], [2] im Text\n"
+                        "- KEINE Quellenliste am Ende! Das System fügt automatisch Quellen hinzu.\n"
+                        "- KEIN Fazit bei Listen-Fragen (z.B. 'Liste Ärzte', 'zeige Hotels').\n"
+                        "  Nur bei Analyse-/Erklärungs-Fragen ein kurzes Fazit anhängen.\n\n"
                         "REGELN:\n"
-                        "- SPRACHE: Antworte in der Sprache der Nutzerfrage (Deutsch → Deutsch)\n"
+                        "- SPRACHE: Antworte in der Sprache der Nutzerfrage\n"
                         "- Extrahiere Fakten aus den Quellen, nicht aus deinem Wissen\n"
                         "- Bei Widersprüchen: benenne beide Positionen\n"
                         "- Keine Code-Blöcke, keine API-Aufrufe\n"
-                        "- Halte die Antwort kompakt (Telegram-Kontext), aber informativ\n\n"
+                        "- Kompakt aber vollständig (Telegram-Kontext)\n\n"
                         "SELBST-BEWERTUNG (PFLICHT):\n"
-                        "Füge am ENDE deiner Antwort (nach den Quellen) EXAKT diesen Block ein:\n"
+                        "Füge am ENDE deiner Antwort EXAKT diesen Block ein:\n"
                         '<!--QUALITY:{"answered":true/false,"confidence":"high"/"medium"/"low",'
                         '"source_count":N,"has_facts":true/false,'
                         '"retry":null oder {"queries":["..."],"time_filter":"d"/"w"/"m"/"none","reason":"..."}}\n'
@@ -2158,8 +2665,8 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                         "- source_count: Anzahl genutzter Quellen\n"
                         "- has_facts: true wenn konkrete Fakten/Zahlen/Termine extrahiert\n"
                         "- retry: null wenn Antwort ausreichend. Sonst ein Objekt mit:\n"
-                        '  - queries: 1-3 bessere Suchbegriffe (z.B. ["Veranstaltungen Konstanz Februar 2026", "Events Bodensee"])\n'
-                        '  - time_filter: "d" (24h), "w" (Woche), "m" (Monat), "none" (unbegrenzt)\n'
+                        '  - queries: 1-3 bessere Suchbegriffe\n'
+                        '  - time_filter: "d"/"w"/"m"/"none"\n'
                         "  - reason: kurze Begründung warum Nachsuche sinnvoll\n"
                         "Empfehle retry wenn: Quellen irrelevant, zu wenig konkrete Daten, "
                         "falsche Sprache der Ergebnisse, oder Frage nur teilweise beantwortet."
@@ -2422,6 +2929,32 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 ]
                 _rc_lower = response_content.lower().strip()
                 _rc_stripped = response_content.strip()
+
+                # ── Detect FALLBACK tag or tool refusal ──
+                _fallback = _parse_fallback_tag(response_content)
+                if _fallback:
+                    log.info(f"[{request_id}] FALLBACK tag found: "
+                             f"search='{_fallback.get('search', '')[:80]}' "
+                             f"reason='{_fallback.get('reason', '')[:60]}'")
+                    _forced_web_search = True
+                    fb_result = await _execute_fallback_search(
+                        _fallback, user_query, trimmed_messages,
+                        provider, model, max_output,
+                        request.temperature or 0.7,
+                        system_prompt, request_id, log,
+                    )
+                    if fb_result:
+                        cascade_costs.append(fb_result["cost"])
+                        cascade_tokens.append(fb_result["tokens"])
+                        llm_result = fb_result["llm_result"]
+                        response_content = fb_result["content"]
+                        tool_calls = None
+                        tools_used = ["web_search"]
+                        log.info(f"[{request_id}] FALLBACK → web_search synthesis done")
+                    else:
+                        # Strip the tag, show whatever the model said
+                        response_content = _fallback.get("_stripped_content", response_content)
+
                 _is_hallucinated_code = (
                     any(p.lower() in _rc_lower for p in _hallucination_patterns)
                     and len(response_content) < 500  # Real answers are longer
@@ -2467,7 +3000,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                             
                             # If no query in JSON, use the user's original question
                             if not _hall_query and _hall_arch:
-                                _hall_query = user_query
+                                _hall_query = _routing_query or user_query
                                 log.info(f"[{request_id}] No query in JSON, using user query: "
                                          f"'{_hall_query[:80]}'")
                             
@@ -2538,7 +3071,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                             max_tokens=max_output,
                             temperature=request.temperature or 0.7,
                             system_prompt=system_prompt,
-                            tools=TOOL_DEFINITIONS if use_tools else None,
+                            tools=_active_tools if use_tools else None,
                         )
                         cascade_costs.append(_retry_result.get("cost_usd", 0))
                         cascade_tokens.append(
@@ -2683,7 +3216,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                                 f"auto-triggering web_search for '{user_query[:60]}'")
                     metrics.increment("refused_to_search_retries")
                     try:
-                        _ws_result = await tool_web_search(query=user_query, depth="deep")
+                        _ws_result = await tool_web_search(query=_routing_query or user_query, depth="deep")
                         if _ws_result and len(_ws_result) > 100:
                             _synth_prompt = build_synthesis_prompt("deep")
                             _auto_msgs = []
@@ -2871,9 +3404,11 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                     )
                     validation.details = [validation.reason]
 
+            # Always set these for use by text stitching below
+            _resp_content = llm_result.get("content", "")
+            _resp_finish = llm_result.get("finish_reason", "stop")
+
             if validation.should_escalate:
-                _resp_content = llm_result.get("content", "")
-                _resp_finish = llm_result.get("finish_reason", "stop")
 
                 log.info(f"[{request_id}] Validation failed on {tier}: "
                          f"finish={_resp_finish}, len={len(_resp_content)}, "
@@ -3071,12 +3606,88 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                             metrics.increment("code_repair_failed",
                                               tags={"tier": tier})
 
+            # ── Try TEXT stitching for non-code truncations ──
+            # When text is truncated (finish_reason=length OR validator detects
+            # mid-sentence truncation with finish_reason=stop), try continuing
+            # on same cheap tier before escalating to premium.
+            _is_text_truncation = (
+                _resp_finish == "length"
+                or "truncation" in (validation.reason or "").lower()
+            )
+            if (validation.should_escalate
+                    and _is_text_truncation
+                    and not _has_code_content(_resp_content)
+                    and tier in ("cheap", "cheap_plus", "medium")):
+                log.info(f"[{request_id}] Text stitch candidate: "
+                         f"len={len(_resp_content)}, tier={tier} "
+                         f"→ trying text continuation before premium")
+                metrics.increment("text_stitch_attempts", tags={"tier": tier})
+
+                _ts_provider = _get_provider_for_tier(tier)
+                _ts_model = _get_model_for_tier(tier)
+                _ts_stitched, _ts_costs, _ts_tokens, _ts_ok = \
+                    await _try_text_stitching(
+                        request_id=request_id,
+                        provider=_ts_provider,
+                        model=_ts_model,
+                        messages=trimmed_messages,
+                        system_prompt=system_prompt,
+                        partial_content=_resp_content,
+                        max_tokens=max_output,
+                        temperature=request.temperature or 0.7,
+                    )
+                cascade_costs.extend(_ts_costs)
+                cascade_tokens.extend(_ts_tokens)
+
+                if _ts_ok and len(_ts_stitched) > len(_resp_content) * 1.2:
+                    # Text stitch produced meaningfully more content
+                    llm_result["content"] = _ts_stitched
+                    llm_result["finish_reason"] = "stop"
+                    validation = validate_response(
+                        response_text=_ts_stitched,
+                        finish_reason="stop",
+                        tier=tier,
+                    )
+                    if not validation.should_escalate:
+                        log.info(f"[{request_id}] Text stitch SUCCESS: "
+                                 f"{len(_resp_content)} → {len(_ts_stitched)} chars, "
+                                 f"stitch_cost=${sum(_ts_costs):.6f} "
+                                 f"(saved premium escalation)")
+                        metrics.increment("text_stitch_success",
+                                          tags={"tier": tier})
+                    else:
+                        log.info(f"[{request_id}] Text stitch completed "
+                                 f"({len(_resp_content)} → {len(_ts_stitched)} chars) "
+                                 f"but validation still fails → premium")
+                else:
+                    log.warning(f"[{request_id}] Text stitch failed → premium")
+                    metrics.increment("text_stitch_failed", tags={"tier": tier})
+
             # If validation still requires escalation (stitch+repair didn't help or non-code)
             if validation.should_escalate:
-                log.warning(f"[{request_id}] Response validation failed ({tier}): "
-                            f"{validation.reason} → escalating to premium")
-                metrics.increment("validation_escalations",
-                                  tags={"from": tier, "reason": validation.details[0][:50] if validation.details else "unknown"})
+                # ── Guard: never escalate greetings/short queries to premium ──
+                # "Huhu" with `---` as last line should never cost $0.08
+                _query_words = user_query.split()
+                _is_short_query = len(_query_words) <= 3 or len(user_query) < 20
+                _is_code_response = _has_code_content(llm_result.get("content", ""))
+                if _is_short_query and not _is_code_response and not _expects_long_code:
+                    log.info(f"[{request_id}] Suppressing premium escalation for "
+                             f"short query '{user_query[:30]}' (non-code response)")
+                    validation.should_escalate = False
+                    metrics.increment("escalation_suppressed_short_query")
+
+            if validation.should_escalate:
+                # ── Guard: never escalate if user explicitly selected a tier ──
+                if _explicit_tier:
+                    log.info(f"[{request_id}] Suppressing premium escalation: "
+                             f"user explicitly selected tier={tier}")
+                    validation.should_escalate = False
+                    metrics.increment("escalation_suppressed_explicit_tier")
+                else:
+                    log.warning(f"[{request_id}] Response validation failed ({tier}): "
+                                f"{validation.reason} → escalating to premium")
+                    metrics.increment("validation_escalations",
+                                      tags={"from": tier, "reason": validation.details[0][:50] if validation.details else "unknown"})
 
                 prev_tier = tier
                 tier = "premium"
@@ -3188,6 +3799,34 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
         _final_content = llm_result.get("content", "") or ""
         _filtered_footer = ""
 
+        # ── Post-synthesis: check for FALLBACK tag or obvious refusal ──
+        # If tools were called but answer still can't help → web_search fallback
+        if (tools_used
+                and not any(t == "web_search" for t in tools_used)
+                and not _forced_web_search
+                and _final_content
+                and len(_final_content) < 500):
+            # Check for FALLBACK tag first (model explicitly asks for web search)
+            _ps_fallback = _parse_fallback_tag(_final_content)
+            if _ps_fallback:
+                log.info(f"[{request_id}] Post-synthesis FALLBACK tag: "
+                         f"search='{_ps_fallback.get('search', '')[:80]}'")
+                _ps_fb_result = await _execute_fallback_search(
+                    _ps_fallback, user_query, trimmed_messages,
+                    provider, model, max_output, 0.7,
+                    system_prompt, request_id, log,
+                )
+                if _ps_fb_result:
+                    cascade_costs.append(_ps_fb_result["cost"])
+                    cascade_tokens.append(_ps_fb_result["tokens"])
+                    _final_content = _ps_fb_result["content"]
+                    llm_result["content"] = _final_content
+                    tools_used.append("web_search")
+                    actual_cost = sum(cascade_costs)
+                    actual_tokens = sum(cascade_tokens)
+                else:
+                    _final_content = _ps_fallback.get("_stripped_content", _final_content)
+
         # ── Parse and strip quality self-assessment tag ──
         _quality_assessment = None
         if "<!--QUALITY:" in _final_content:
@@ -3222,6 +3861,12 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 ).rstrip()
 
         # Log quality warnings for monitoring
+        # Also strip any FALLBACK tags that slipped through
+        if "<!--FALLBACK:" in _final_content:
+            import re as _re_fb
+            _final_content = _re_fb.sub(
+                r'<!--FALLBACK:.*?-->', '', _final_content, flags=_re_fb.DOTALL
+            ).rstrip()
         if _quality_assessment:
             _qa = _quality_assessment
             if not _qa.get("answered", True):
@@ -3237,9 +3882,9 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
             _retry = _qa.get("retry")
             if (_retry and isinstance(_retry, dict)
                     and _retry.get("queries")
-                    and not getattr(main, '_quality_retry_done', False)):
+                    and not _forced_web_search):  # Don't retry if already a forced search
                 _retry_queries = _retry["queries"][:3]
-                _retry_tf = _retry.get("time_filter", "w")
+                _retry_tf = _retry.get("time_filter", "none")
                 _retry_reason = _retry.get("reason", "low quality")
                 log.info(f"[{request_id}] Quality retry recommended: "
                          f"queries={_retry_queries} tf={_retry_tf} "
@@ -3386,19 +4031,24 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 # ── Strip model-generated source sections ──
                 # The model sometimes generates its own "Quellen:" with hallucinated URLs.
                 # We replace them with our real footer from build_source_footer().
+                # Use IGNORECASE to catch QUELLEN:, Quellen:, quellen:, SOURCES:, etc.
                 _source_section_patterns = [
-                    r'\n---\s*\n\*?\*?Quellen:?\*?\*?\s*\n.*',  # Our format + bold
-                    r'\nQuellen:\s*\n\[1\].*',                    # Standard
-                    r'\nSources:\s*\n\[1\].*',                    # English
-                    r'\nQuellen:\s*\n\*?\*?\[1\].*',              # Bold refs
-                    r'\n\*\*Quellen:?\*\*\s*\n.*',                # Bold header
-                    r'\n\*\*Sources:?\*\*\s*\n.*',                # Bold English
-                    r'\nQuellen:\s*\n[•\-].*',                    # Bullet format
-                    r'\nQuellen:\s*\n\d+\..*',                    # Numbered format
-                    r'\nQuellen:\s*\nhttps?://.*',                # Direct URLs
+                    r'\n---\s*\n\*?\*?quellen:?\*?\*?\s*\n.*',  # Our format + bold
+                    r'\nquellen:\s*\n\[1\].*',                    # Standard
+                    r'\nsources:\s*\n\[1\].*',                    # English
+                    r'\nquellen:\s*\n\*?\*?\[1\].*',              # Bold refs
+                    r'\n\*\*quellen:?\*\*\s*\n.*',                # Bold header
+                    r'\n\*\*sources:?\*\*\s*\n.*',                # Bold English
+                    r'\nquellen:\s*\n[•\-].*',                    # Bullet format
+                    r'\nquellen:\s*\n\d+\..*',                    # Numbered format
+                    r'\nquellen:\s*\nhttps?://.*',                # Direct URLs
+                    r'\nquellen:\s*\nURL:.*',                     # URL: prefix format
+                    r'\nsources:\s*\n[•\-\d].*',                  # English bullet/numbered
+                    r'\nsources:\s*\nhttps?://.*',                # English direct URLs
                 ]
                 for pattern in _source_section_patterns:
-                    _stripped = _re.sub(pattern, '', _final_content, flags=_re.DOTALL)
+                    _stripped = _re.sub(pattern, '', _final_content,
+                                        flags=_re.DOTALL | _re.IGNORECASE)
                     if len(_stripped) < len(_final_content):
                         log.info(f"[{request_id}] Stripped model-generated source section "
                                  f"({len(_final_content) - len(_stripped)} chars)")
@@ -3476,6 +4126,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                 "id": request_id,
                 "ts": datetime.utcnow().isoformat() + "Z",
                 "query": user_query[:300],
+                "routing_query": (_routing_query[:200] if _routing_query != user_query else None),
                 "tier": tier,
                 "model": model,
                 "cost_usd": actual_cost,
@@ -3512,6 +4163,32 @@ async def chat_completions(request: ChatRequest, raw_request: Request = None,
                                else route_result.is_code_generation if route_result
                                and hasattr(route_result, 'is_code_generation') else False),
                     "needs_web": _needs_web_search if cascade_mode else None,
+                    "reason": (enhanced_result.reason if enhanced_result
+                              else route_result.reason if route_result else None),
+                },
+                "classifier": {
+                    "route_result": {
+                        "action": route_result.action.value if route_result else None,
+                        "needs_web": route_result.needs_web if route_result and hasattr(route_result, 'needs_web') else None,
+                        "is_code": route_result.is_code_generation if route_result and hasattr(route_result, 'is_code_generation') else None,
+                        "response_type": route_result.response_type if route_result else None,
+                        "reason": route_result.reason if route_result else None,
+                    } if route_result else None,
+                    "enhanced_result": {
+                        "action": enhanced_result.action.value,
+                        "needs_web": enhanced_result.needs_web if hasattr(enhanced_result, 'needs_web') else None,
+                        "is_code": enhanced_result.is_code_generation,
+                        "response_type": enhanced_result.response_type,
+                        "reason": enhanced_result.reason,
+                    } if enhanced_result else None,
+                    "first_llm_tool_calls": (
+                        [tc.get("function", {}).get("name", "?") for tc in (llm_result.get("tool_calls") or [])]
+                        if llm_result.get("tool_calls") else None
+                    ),
+                    "fast_web_path": _used_fast_web_path,
+                    "forced_web_search": _forced_web_search,
+                    "agent_tool_history": _agent_has_tool_history if _is_agent_session else None,
+                    "tools_active": [t["function"]["name"] for t in _active_tools] if _active_tools else [],
                 },
                 "web_enrichment": web_enrichment_ctx[:200] if web_enrichment_ctx else None,
                 "quality": _quality_assessment,
@@ -4001,6 +4678,9 @@ async def extract_file(req: FileExtractRequest, auth: bool = Depends(verify_auth
         # Audio files → redirect to transcription
         audio_exts = {"m4a", "mp3", "wav", "ogg", "webm", "flac", "aac", "wma", "opus"}
         if ext in audio_exts:
+            if not config.tools.transcription:
+                return {"text": f"[Audio-Datei: {req.filename}]", "type": "skipped",
+                        "reason": "transcription disabled", "chars": 0}
             mime_map = {
                 "m4a": "audio/mp4", "mp3": "audio/mpeg", "wav": "audio/wav",
                 "ogg": "audio/ogg", "webm": "audio/webm", "flac": "audio/flac",
@@ -4018,12 +4698,21 @@ async def extract_file(req: FileExtractRequest, auth: bool = Depends(verify_auth
             }
 
         if ext == "pdf":
+            if not config.tools.pdf:
+                return {"text": f"[PDF-Datei: {req.filename}]", "type": "skipped",
+                        "reason": "pdf extraction disabled", "chars": 0}
             return await _extract_pdf(raw, req.filename)
         elif ext in ("docx", "doc"):
+            if not config.tools.docx:
+                return {"text": f"[Dokument: {req.filename}]", "type": "skipped",
+                        "reason": "docx extraction disabled", "chars": 0}
             return await _extract_docx(raw, req.filename)
         elif ext in ("xlsx", "xls", "csv"):
             return await _extract_xlsx(raw, req.filename, ext)
         elif ext in ("zip", "tar", "gz", "tgz"):
+            if not config.tools.zip:
+                return {"text": f"[Archiv: {req.filename}]", "type": "skipped",
+                        "reason": "archive extraction disabled", "chars": 0}
             return await _extract_archive(raw, req.filename, ext)
         else:
             # Try as plain text
@@ -4515,6 +5204,8 @@ async def transcribe_audio(req: TranscribeRequest, auth: bool = Depends(verify_a
     Tier 1: Groq Whisper API (fast, free tier)
     Tier 2: Local faster-whisper (offline, no API key needed)
     """
+    if not config.tools.transcription:
+        return {"text": "", "method": "skipped", "reason": "transcription disabled"}
     import tempfile
 
     # Decode audio

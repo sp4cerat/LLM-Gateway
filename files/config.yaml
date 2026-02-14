@@ -84,17 +84,31 @@ security:
 # ─── Web Search Pipeline ─────────────────────────────────────────────────────
 # Controls how web_search tool works (DDG/Google/Bing scraping, result counts, sources)
 web_search:
-  max_snippets: 5            # Max DDG snippet results per query (1-10)
-  min_pages: 2               # MINIMUM pages to always download (even for simple queries)
-  max_pages_deep: 5          # Full-text pages to download in 'deep' mode (1-8)
+  max_snippets: 8            # Max DDG snippet results per query (1-10)
+  min_pages: 4               # MINIMUM pages to always download (even for simple queries)
+  max_pages_deep: 6          # Full-text pages to download in 'deep' mode (1-8)
   max_pages_thorough: 8      # Full-text pages to download in 'thorough' mode (1-10)
   max_page_chars: 12000      # Max chars extracted per page (~3000 tokens). Higher = more content but more cost
   page_fetch_timeout: 8.0    # Timeout per page fetch in seconds
   show_sources: true         # Append source URLs as footnotes to LLM response
   source_format: "footer"    # "footer" = [1] URL at end, "none" = disabled
-  engines: ["ddg"]           # Search engines (order = priority): "ddg", "google", "bing"
+  engines: ["ddg", "bing"]    # Search engines (order = priority): "ddg", "google", "bing"
   multi_query: true          # Allow model to issue multiple parallel search queries
   max_queries: 3             # Max parallel queries per search call (1-5)
+
+# ─── Tool Skills ─────────────────────────────────────────────────────────────
+# Enable/disable individual tool capabilities.
+# Disabled tools are hidden from the model and will not be called.
+tools:
+  web_search: true        # Web search (DDG/Bing scraping, fact-checking, research)
+  weather: true           # Weather forecasts via Open-Meteo (free, no key)
+  stocks: true            # Stock/crypto prices via yfinance (free, no key)
+  news: true              # News headlines via NewsAPI (free tier: 100 req/day)
+  vision: true            # Image analysis / OCR (uses vision-capable model)
+  transcription: true     # Audio transcription via Whisper API
+  pdf: true               # PDF text extraction (/v1/files/extract)
+  docx: true              # DOCX/DOC text extraction (/v1/files/extract)
+  zip: true               # ZIP/TAR archive extraction (/v1/files/extract)
 
 # ─── Code Generation (Agent Sessions) ─────────────────────────────────────────
 # Controls model selection for code generation in OpenClaw agent sessions.

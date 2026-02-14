@@ -26,6 +26,7 @@ class RouterResult(BaseModel):
     response_type: str = "explanation_generic"
     reason: str = ""
     is_code_generation: bool = False
+    needs_web: bool = False
 
 
 # ─── API Request/Response (OpenAI-Compatible) ────────────────────────────────
@@ -308,12 +309,15 @@ class GatewayConfig(BaseModel):
     mock_mode: bool = False
     web_search: "WebSearchConfig" = None  # type: ignore
     code_generation: "CodeGenerationConfig" = None  # type: ignore
+    tools: "ToolsConfig" = None  # type: ignore
 
     def model_post_init(self, __context):
         if self.web_search is None:
             self.web_search = WebSearchConfig()
         if self.code_generation is None:
             self.code_generation = CodeGenerationConfig()
+        if self.tools is None:
+            self.tools = ToolsConfig()
 
 
 class WebSearchConfig(BaseModel):
@@ -350,3 +354,16 @@ class CodeGenerationConfig(BaseModel):
     # Detection: which agent tools indicate code generation
     code_tool_names: list[str] = ["exec", "write", "create_file", "edit_file",
                                    "patch_file", "sub_agent"]
+
+
+class ToolsConfig(BaseModel):
+    """Enable/disable individual tool skills."""
+    web_search: bool = True      # Web search (DDG/Bing/Google scraping)
+    weather: bool = True         # Weather via Open-Meteo
+    stocks: bool = True          # Stock/crypto prices via yfinance
+    news: bool = True            # News headlines via NewsAPI
+    vision: bool = True          # Image analysis / OCR
+    transcription: bool = True   # Audio transcription via Whisper
+    pdf: bool = True             # PDF text extraction
+    docx: bool = True            # DOCX/DOC text extraction
+    zip: bool = True             # ZIP/TAR archive extraction

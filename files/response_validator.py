@@ -237,13 +237,36 @@ def _check_truncation_patterns(text: str) -> tuple[bool, str]:
     if len(lines) > 20:
         last_line = lines[-1].strip()
         # Very short last line that doesn't look like a natural ending
-        # EXCLUDE: code fences (```), common endings
+        # EXCLUDE: code fences (```), markdown separators (---), common endings
         natural_short_endings = ('.', ')', ']', '}', ';', ':', '```', '`',
-                                  '"""', "'''", '*/', '-->', '?>')
+                                  '"""', "'''", '*/', '-->', '?>', '!')
+        natural_short_lines = {'```', '---', '***', '___', '|', '> ', ''}
         if (0 < len(last_line) < 5 
             and not any(last_line.endswith(e) for e in natural_short_endings)
-            and last_line not in ('```',)):  # Explicit code fence check
+            and last_line not in natural_short_lines):
             return False, f"Suspiciously short last line: '{last_line}' — possible truncation"
+    
+    # ── Mid-sentence truncation: long response ends without sentence punctuation ──
+    # Gemini Flash sometimes returns finish_reason="stop" but stops mid-sentence.
+    # Detect: response > 500 chars, last char is not sentence-ending punctuation.
+    if len(stripped) > 500:
+        # Get last non-markdown, non-whitespace character
+        _tail = stripped.rstrip('*_ \t\n')  # Strip trailing bold/italic/whitespace
+        if _tail:
+            # Check if last line is a markdown structural element (separator, fence, etc.)
+            _last_line_raw = _tail.split('\n')[-1].strip()
+            _structural_lines = {'---', '***', '___', '```', '|', '> '}
+            if _last_line_raw not in _structural_lines:
+                _last_char = _tail[-1]
+                _sentence_endings = {'.', '!', '?', ':', ')', ']', '}', '"', "'",
+                                      '`', '>', ';', '|', '–', '—', '-'}
+                if _last_char not in _sentence_endings:
+                    _is_list_heading = (_last_line_raw.startswith(('#', '-', '*', '1.', '2.', '3.'))
+                                        and len(_last_line_raw) < 80
+                                        and _last_line_raw.rstrip().endswith(':'))
+                    if not _is_list_heading:
+                        return False, (f"Mid-sentence truncation: response ends with "
+                                       f"'{_tail[-30:]}' — no sentence-ending punctuation")
     
     return True, ""
 
