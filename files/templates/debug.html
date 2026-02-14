@@ -152,6 +152,9 @@ function render() {
     if (e.routing?.is_code) tags.push(`<span class="tag code">🔨code</span>`);
     if (e.routing?.needs_web) tags.push(`<span class="tag web">🌐web</span>`);
     if (e.response_tool_calls?.length) tags.push(`<span class="tag tools">→${e.response_tool_calls.join(',')}</span>`);
+    if (e.classifier?.first_llm_tool_calls?.length) tags.push(`<span class="tag tools">1st:${e.classifier.first_llm_tool_calls.join(',')}</span>`);
+    if (e.classifier?.fast_web_path) tags.push(`<span class="tag web">⚡fast</span>`);
+    if (e.classifier?.forced_web_search) tags.push(`<span class="tag web">🔄forced</span>`);
     if (e.quality) {
       const q = e.quality;
       const qColor = !q.answered ? '#e44' : q.confidence === 'low' ? '#e90' : q.confidence === 'medium' ? '#cc0' : '#4a4';
@@ -178,11 +181,52 @@ function render() {
             <div class="meta-item"><div class="label">Escalated</div><div class="value">${e.escalated||'—'}</div></div>
             <div class="meta-item"><div class="label">Routing</div><div class="value">${e.routing?.action||'—'} → ${e.routing?.response_type||'—'}</div></div>
             <div class="meta-item"><div class="label">Agent</div><div class="value">${e.is_agent ? 'Yes' : 'No'}</div></div>
+            ${e.routing_query ? `<div class="meta-item" style="grid-column:1/-1"><div class="label">Routing Query (cleaned)</div><div class="value" style="color:var(--cyan)">${esc(e.routing_query)}</div></div>` : ''}
           </div>
         </div>
         ${e.system_prompt ? `<div class="section">
           <div class="section-title">System Prompt</div>
           <pre>${esc(e.system_prompt)}</pre>
+        </div>` : ''}
+        ${e.classifier ? `<div class="section">
+          <div class="section-title">Classifier / Router</div>
+          <pre>${(() => {
+            const c = e.classifier;
+            let lines = [];
+            if (c.route_result) {
+              const r = c.route_result;
+              lines.push('<span class="role-system">Router Classification:</span>');
+              lines.push('  action:    ' + (r.action || '—'));
+              lines.push('  needs_web: ' + (r.needs_web === true ? '<span style="color:var(--cyan)">✓ true</span>' : r.needs_web === false ? '<span style="color:var(--dim)">✗ false</span>' : '—'));
+              lines.push('  is_code:   ' + (r.is_code === true ? '<span style="color:var(--red)">✓ true</span>' : r.is_code === false ? '<span style="color:var(--dim)">✗ false</span>' : '—'));
+              lines.push('  type:      ' + (r.response_type || '—'));
+              lines.push('  reason:    ' + esc(r.reason || '—'));
+            }
+            if (c.enhanced_result) {
+              const er = c.enhanced_result;
+              lines.push('');
+              lines.push('<span class="role-system">Enhanced Router:</span>');
+              lines.push('  action:    ' + (er.action || '—'));
+              lines.push('  needs_web: ' + (er.needs_web === true ? '<span style="color:var(--cyan)">✓ true</span>' : er.needs_web === false ? '<span style="color:var(--dim)">✗ false</span>' : '—'));
+              lines.push('  is_code:   ' + (er.is_code === true ? '<span style="color:var(--red)">✓ true</span>' : er.is_code === false ? '<span style="color:var(--dim)">✗ false</span>' : '—'));
+              lines.push('  type:      ' + (er.response_type || '—'));
+              lines.push('  reason:    ' + esc(er.reason || '—'));
+            }
+            lines.push('');
+            lines.push('<span class="role-system">Pipeline Decisions:</span>');
+            lines.push('  fast_web_path:     ' + (c.fast_web_path ? '<span style="color:var(--cyan)">✓</span>' : '<span style="color:var(--dim)">✗</span>'));
+            lines.push('  forced_web_search: ' + (c.forced_web_search ? '<span style="color:var(--orange)">✓</span>' : '<span style="color:var(--dim)">✗</span>'));
+            if (c.agent_tool_history != null) {
+              lines.push('  agent_tool_hist:  ' + (c.agent_tool_history ? '<span style="color:var(--purple)">✓ (conservative mode)</span>' : '<span style="color:var(--dim)">✗</span>'));
+            }
+            if (c.first_llm_tool_calls) {
+              lines.push('  1st LLM tools:    <span style="color:var(--red)">' + c.first_llm_tool_calls.join(', ') + '</span>');
+            }
+            if (c.tools_active?.length) {
+              lines.push('  active tools:      ' + c.tools_active.join(', '));
+            }
+            return lines.join('\n');
+          })()}</pre>
         </div>` : ''}
         <div class="section">
           <div class="section-title">Messages → LLM (${e.messages?.length || 0} msgs)</div>
